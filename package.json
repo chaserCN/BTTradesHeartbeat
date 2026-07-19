@@ -1,0 +1,14 @@
+{
+  "name": "trades-heartbeat-telegram-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node bot.mjs",
+    "once": "RUN_ONCE=true node bot.mjs",
+    "dry": "RUN_ONCE=true DRY_RUN=true node bot.mjs"
+  },
+  "engines": {
+    "node": ">=22.13"
+  }
+}

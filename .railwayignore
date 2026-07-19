@@ -1,0 +1,6 @@
+.env
+heartbeat_state.json
+heartbeat_state.json.imported
+heartbeat.db
+heartbeat.db-wal
+heartbeat.db-shm
