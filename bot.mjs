@@ -166,6 +166,9 @@ async function heartbeatCycle() {
     }
 
     await maybeNotifyVerdict(probe);
+    if (activeProbe.resultChatId) {
+      await sendTelegramMessage(activeProbe.resultChatId, formatManualCheckMessage(probe));
+    }
   } finally {
     activeProbe = null;
   }
@@ -178,8 +181,11 @@ async function runManualCheck(chatId) {
   if (activeProbe) {
     // While a probe runs, repeated /check commands are not processed: the
     // first duplicate gets one short notice, the rest are dropped silently.
+    // A scheduled healthy probe is normally silent, so remember this request
+    // and explicitly send that probe's final result to the chat.
     if (!activeProbe.notifiedBusy) {
       activeProbe.notifiedBusy = true;
+      if (activeProbe.source === "scheduled") activeProbe.resultChatId = chatId;
       const elapsedMs = Date.now() - activeProbe.startedAtMs;
       const remainingSeconds = Math.max(10, Math.round((activeProbe.windowMs - elapsedMs) / 1000));
       await sendTelegramMessage(
