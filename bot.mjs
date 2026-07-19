@@ -15,8 +15,9 @@ const config = {
   krakenUrl: process.env.KRAKEN_URL || "wss://ws.kraken.com/v2",
   krakenSymbol: process.env.KRAKEN_SYMBOL || "BTC/USD",
   probeIntervalMs: Math.max(5, Number(process.env.PROBE_INTERVAL_MINUTES || 60)) * 60_000,
+  probeWarmupMs: Math.max(1, Number(process.env.PROBE_WARMUP_SECONDS || 3)) * 1000,
   probeWindowMs: Math.max(30, Number(process.env.PROBE_WINDOW_SECONDS || 90)) * 1000,
-  probeMaxWindowMs: Math.max(60, Number(process.env.PROBE_MAX_WINDOW_SECONDS || 180)) * 1000,
+  probeDrainMs: Math.max(1, Number(process.env.PROBE_DRAIN_SECONDS || 10)) * 1000,
   connectTimeoutMs: Math.max(5, Number(process.env.CONNECT_TIMEOUT_SECONDS || 15)) * 1000,
   confirmDelayMs: Math.max(30, Number(process.env.CONFIRM_DELAY_SECONDS || 120)) * 1000,
   quietHoursTimeZone: process.env.QUIET_HOURS_TIME_ZONE || "Europe/Kyiv",
@@ -32,12 +33,11 @@ const config = {
 // Kraken trades with a typical delay of ~7ms and 100% coverage, so these are
 // generous — anything beyond them means users actually feel the problem.
 const thresholds = {
-  minTradesForVerdict: 3, // fewer Kraken trades than this => market too quiet to judge
-  silentFeedMinTrades: 5, // Kraken saw at least this many, we saw zero => feed is down
-  minCoverage: 0.8, // delivered less than 80% of trades => degraded
   slowDelayMs: 5_000, // slowest matched trades later than this => degraded
-  matchGraceMs: 10_000, // ignore Kraken trades from the last seconds of the window
 };
+
+const expectedProbeDurationMs =
+  (2 * config.probeWarmupMs) + (2 * config.connectTimeoutMs) + config.probeWindowMs + config.probeDrainMs;
 
 // Storage: SQLite (built into Node, no dependencies). Two data tables — one
 // row per probe ("проверка"), one row per lost trade ("сделка") — plus a
@@ -101,12 +101,15 @@ let lastScheduledCycleAtMs = null;
 console.log(
   `Starting trades heartbeat bot. Feed: ${config.feedUrl} (${config.feedChannel}). ` +
     `Reference: ${config.krakenUrl} (${config.krakenSymbol}). ` +
-    `Interval: ${Math.round(config.probeIntervalMs / 60_000)} min, window: ${Math.round(config.probeWindowMs / 1000)}s.` +
+    `Interval: ${Math.round(config.probeIntervalMs / 60_000)} min, ` +
+    `warmup: ${Math.round(config.probeWarmupMs / 1000)}s per subscription, ` +
+    `window: ${Math.round(config.probeWindowMs / 1000)}s, ` +
+    `drain: ${Math.round(config.probeDrainMs / 1000)}s.` +
     `${config.dryRun ? " DRY_RUN: Telegram messages go to console." : ""}`,
 );
 
-// Command polling starts before the first probe: the initial probe takes
-// ~90s and commands must be answered during it, not after.
+// Command polling starts before the first probe and stays responsive while
+// subscriptions warm up, the reference window runs, and late trades drain.
 if (!config.runOnce) {
   setInterval(() => {
     pollTelegramCommands().catch((error) => {
@@ -136,7 +139,7 @@ async function heartbeatCycle() {
     console.log("Another probe is in progress; skipping this scheduled cycle.");
     return;
   }
-  activeProbe = { startedAtMs: Date.now(), windowMs: config.probeWindowMs, source: "scheduled" };
+  activeProbe = { startedAtMs: Date.now(), windowMs: expectedProbeDurationMs, source: "scheduled" };
   lastScheduledCycleAtMs = Date.now();
 
   try {
@@ -186,12 +189,13 @@ async function runManualCheck(chatId) {
     }
     return;
   }
-  activeProbe = { startedAtMs: Date.now(), windowMs: config.probeWindowMs, source: "manual" };
+  activeProbe = { startedAtMs: Date.now(), windowMs: expectedProbeDurationMs, source: "manual" };
 
   try {
     await sendTelegramMessage(
       chatId,
-      `Запускаю перевірку. Слухаю сервер і біржу ${Math.round(config.probeWindowMs / 1000)} с, результат надішлю сюди.`,
+      `Запускаю перевірку: підготую підписки, ${Math.round(config.probeWindowMs / 1000)} с порівнюватиму угоди ` +
+        `і ще ${Math.round(config.probeDrainMs / 1000)} с чекатиму на останні доставки. Результат надішлю сюди.`,
     );
     const probe = await runProbe();
     recordProbe(probe);
@@ -215,7 +219,7 @@ async function runManualCheck(chatId) {
 // alone — Kraken's own stream is the reference that tells them apart.
 async function runProbe() {
   const startedAtMs = Date.now();
-  const session = await collectSession(config.probeWindowMs, config.probeMaxWindowMs);
+  const session = await collectSession(config.probeWindowMs, config.probeWarmupMs, config.probeDrainMs);
   const metrics = computeMetrics(session);
   const verdict = judge(session, metrics);
 
@@ -250,116 +254,176 @@ async function runProbe() {
   return probe;
 }
 
-function collectSession(windowMs, maxWindowMs) {
+function collectSession(windowMs, warmupMs, drainMs) {
   return new Promise((resolve) => {
     const session = {
-      windowMs,
+      windowMs: 0,
+      startedAtMs: null,
+      referenceEndedAtMs: null,
       endedAtMs: null,
       feed: { handshakeMs: null, connectFailed: false, trades: [], closes: 0, errors: 0 },
       kraken: { connected: false, connectFailed: false, disconnected: false, trades: [] },
     };
 
-    const startMs = Date.now();
+    const connectionStartedAtMs = Date.now();
     let finished = false;
+    let phase = "connecting_feed";
     let feedSocket = null;
     let krakenSocket = null;
+    let feedConnectTimer = null;
+    let warmupTimer = null;
+    let krakenConnectTimer = null;
+    let syncTimer = null;
+    let measurementTimer = null;
+    let drainTimer = null;
 
     const finish = () => {
       if (finished) return;
       finished = true;
+      phase = "finished";
+      for (const timer of [feedConnectTimer, warmupTimer, krakenConnectTimer, syncTimer, measurementTimer, drainTimer]) {
+        if (timer) clearTimeout(timer);
+      }
       session.endedAtMs = Date.now();
-      session.windowMs = session.endedAtMs - startMs;
+      if (session.startedAtMs !== null) {
+        session.windowMs = (session.referenceEndedAtMs ?? session.endedAtMs) - session.startedAtMs;
+      }
       for (const socket of [feedSocket, krakenSocket]) {
         try { socket?.close(); } catch { /* already closed */ }
       }
       resolve(session);
     };
 
-    try {
-      feedSocket = new WebSocket(config.feedUrl);
-    } catch {
-      session.feed.connectFailed = true;
-    }
+    const beginMeasurement = () => {
+      if (finished || phase !== "syncing") return;
 
-    if (feedSocket) {
-      const connectTimer = setTimeout(() => {
-        if (session.feed.handshakeMs === null) {
-          session.feed.connectFailed = true;
-          try { feedSocket.close(); } catch { /* ignore */ }
-        }
-      }, config.connectTimeoutMs);
+      // Both subscriptions are ready. Discard everything seen during setup so
+      // the reference and feed start at the same boundary.
+      session.feed.trades = [];
+      session.kraken.trades = [];
+      session.startedAtMs = Date.now();
+      phase = "measuring";
 
-      feedSocket.onopen = () => {
-        clearTimeout(connectTimer);
-        session.feed.handshakeMs = Date.now() - startMs;
-        feedSocket.send(JSON.stringify({ subscribe: config.feedChannel }));
-      };
-      feedSocket.onmessage = (event) => {
-        const trade = parseFeedTrade(event.data);
-        if (trade) session.feed.trades.push(trade);
-      };
-      feedSocket.onerror = () => {
-        session.feed.errors += 1;
-        if (session.feed.handshakeMs === null) session.feed.connectFailed = true;
-      };
-      feedSocket.onclose = () => {
-        if (!finished) session.feed.closes += 1;
-      };
-    }
+      measurementTimer = setTimeout(() => {
+        if (finished || phase !== "measuring") return;
+        session.referenceEndedAtMs = Date.now();
+        phase = "draining";
 
-    try {
-      krakenSocket = new WebSocket(config.krakenUrl);
-    } catch {
-      session.kraken.connectFailed = true;
-    }
+        // The reference window is now fixed. Stop Kraken and give only our
+        // feed extra time to deliver trades emitted just before the boundary.
+        try { krakenSocket?.close(); } catch { /* already closed */ }
+        drainTimer = setTimeout(finish, drainMs);
+      }, windowMs);
+    };
 
-    if (krakenSocket) {
-      const connectTimer = setTimeout(() => {
-        if (!session.kraken.connected) {
+    const connectKraken = () => {
+      if (finished) return;
+      phase = "connecting_kraken";
+
+      try {
+        krakenSocket = new WebSocket(config.krakenUrl);
+      } catch {
+        session.kraken.connectFailed = true;
+        finish();
+        return;
+      }
+
+      // This timeout includes both the WebSocket handshake and Kraken's
+      // subscription acknowledgement.
+      krakenConnectTimer = setTimeout(() => {
+        if (phase === "connecting_kraken") {
           session.kraken.connectFailed = true;
-          try { krakenSocket.close(); } catch { /* ignore */ }
+          finish();
         }
       }, config.connectTimeoutMs);
 
       krakenSocket.onopen = () => {
-        clearTimeout(connectTimer);
         session.kraken.connected = true;
         krakenSocket.send(
           JSON.stringify({ method: "subscribe", params: { channel: "trade", symbol: [config.krakenSymbol], snapshot: false } }),
         );
       };
       krakenSocket.onmessage = (event) => {
-        for (const trade of parseKrakenTrades(event.data)) {
-          session.kraken.trades.push(trade);
+        const message = parseKrakenMessage(event.data);
+        if (message.subscription === "accepted" && phase === "connecting_kraken") {
+          clearTimeout(krakenConnectTimer);
+          phase = "syncing";
+          syncTimer = setTimeout(beginMeasurement, warmupMs);
+          return;
+        }
+        if (message.subscription === "rejected") {
+          session.kraken.connectFailed = true;
+          console.error(`Kraken subscription failed: ${message.error || "unknown error"}`);
+          finish();
+          return;
+        }
+        if (phase === "measuring") {
+          session.kraken.trades.push(...message.trades);
         }
       };
       krakenSocket.onerror = () => {
-        if (session.kraken.connected) {
-          session.kraken.disconnected = true;
-        } else {
+        if (phase === "connecting_kraken") {
           session.kraken.connectFailed = true;
+          finish();
+        } else if (phase === "syncing" || phase === "measuring") {
+          session.kraken.disconnected = true;
+          finish();
         }
       };
       krakenSocket.onclose = () => {
-        if (!finished) {
-          if (session.kraken.connected) {
-            session.kraken.disconnected = true;
-          } else {
-            session.kraken.connectFailed = true;
-          }
+        if (finished || phase === "draining") return;
+        if (phase === "connecting_kraken") {
+          session.kraken.connectFailed = true;
+        } else if (phase === "syncing" || phase === "measuring") {
+          session.kraken.disconnected = true;
         }
+        finish();
       };
+    };
+
+    try {
+      feedSocket = new WebSocket(config.feedUrl);
+    } catch {
+      session.feed.connectFailed = true;
+      finish();
+      return;
     }
 
-    setTimeout(() => {
-      // Quiet market: too few reference trades to judge. Keep listening up to
-      // the extended window before giving up on this probe.
-      if (session.kraken.trades.length < thresholds.minTradesForVerdict && maxWindowMs > windowMs) {
-        setTimeout(finish, maxWindowMs - windowMs);
-      } else {
+    feedConnectTimer = setTimeout(() => {
+      if (session.feed.handshakeMs === null) {
+        session.feed.connectFailed = true;
         finish();
       }
-    }, windowMs);
+    }, config.connectTimeoutMs);
+
+    feedSocket.onopen = () => {
+      clearTimeout(feedConnectTimer);
+      session.feed.handshakeMs = Date.now() - connectionStartedAtMs;
+      feedSocket.send(JSON.stringify({ subscribe: config.feedChannel }));
+      phase = "warming_feed";
+      warmupTimer = setTimeout(connectKraken, warmupMs);
+    };
+    feedSocket.onmessage = (event) => {
+      if (phase === "measuring" || phase === "draining") {
+        const trade = parseFeedTrade(event.data);
+        if (trade) session.feed.trades.push(trade);
+      }
+    };
+    feedSocket.onerror = () => {
+      session.feed.errors += 1;
+      if (phase === "connecting_feed" || phase === "warming_feed" || phase === "connecting_kraken" || phase === "syncing") {
+        session.feed.connectFailed = true;
+        finish();
+      }
+    };
+    feedSocket.onclose = () => {
+      if (finished) return;
+      session.feed.closes += 1;
+      if (phase === "connecting_feed" || phase === "warming_feed" || phase === "connecting_kraken" || phase === "syncing") {
+        session.feed.connectFailed = true;
+        finish();
+      }
+    };
   });
 }
 
@@ -370,32 +434,48 @@ function parseFeedTrade(raw) {
   } catch {
     return null;
   }
-  if (payload?.price == null || payload?.time == null) return null;
-  return { atMs: Date.now(), price: Number(payload.price), quantity: Number(payload.quantity) };
+  if (payload?.price == null || payload?.quantity == null || payload?.time == null) return null;
+  const price = Number(payload.price);
+  const quantity = Number(payload.quantity);
+  if (!Number.isFinite(price) || !Number.isFinite(quantity)) return null;
+  return { atMs: Date.now(), price, quantity };
 }
 
-function parseKrakenTrades(raw) {
+function parseKrakenMessage(raw) {
   let payload;
   try {
     payload = JSON.parse(raw);
   } catch {
-    return [];
+    return { subscription: null, error: null, trades: [] };
   }
-  if (payload?.channel !== "trade" || !Array.isArray(payload.data)) return [];
-  return payload.data.map((trade) => ({
-    atMs: Date.now(),
-    price: Number(trade.price),
-    quantity: Number(trade.qty),
-  }));
+
+  if (payload?.method === "subscribe") {
+    return {
+      subscription: payload.success === true ? "accepted" : "rejected",
+      error: payload.error || null,
+      trades: [],
+    };
+  }
+
+  if (payload?.channel !== "trade" || payload?.type !== "update" || !Array.isArray(payload.data)) {
+    return { subscription: null, error: null, trades: [] };
+  }
+
+  const receivedAtMs = Date.now();
+  const trades = payload.data
+    .map((trade) => ({
+      atMs: receivedAtMs,
+      price: Number(trade.price),
+      quantity: Number(trade.qty),
+    }))
+    .filter((trade) => Number.isFinite(trade.price) && Number.isFinite(trade.quantity));
+  return { subscription: null, error: null, trades };
 }
 
 function computeMetrics(session) {
-  // Trades from the very end of the window may legitimately still be in
-  // flight, so they do not count against coverage.
-  const judgeable = session.kraken.trades.filter(
-    (trade) => trade.atMs <= session.endedAtMs - thresholds.matchGraceMs,
-  );
-  const reference = judgeable.length >= thresholds.minTradesForVerdict ? judgeable : session.kraken.trades;
+  // Kraken stops at the reference boundary while our feed keeps draining, so
+  // every reference trade has had the full delivery grace period.
+  const reference = session.kraken.trades;
 
   const usedFeedIndices = new Set();
   const delays = [];
@@ -442,10 +522,10 @@ function judge(session, metrics) {
     // Cannot judge without the reference. Do not blame our feed.
     return { verdict: "inconclusive", note: "kraken_unavailable" };
   }
-  if (session.kraken.trades.length < thresholds.minTradesForVerdict) {
+  if (session.kraken.trades.length === 0) {
     return { verdict: "inconclusive", note: "quiet_market" };
   }
-  if (session.feed.trades.length === 0 && session.kraken.trades.length >= thresholds.silentFeedMinTrades) {
+  if (session.feed.trades.length === 0) {
     return { verdict: "down", note: "feed_silent" };
   }
   if (metrics.matched === 0) {
@@ -454,7 +534,7 @@ function judge(session, metrics) {
   if (session.feed.closes > 0) {
     return { verdict: "degraded", note: "socket_dropped" };
   }
-  if (metrics.coveragePct !== null && metrics.coveragePct < thresholds.minCoverage * 100) {
+  if (metrics.matched < metrics.referenceTrades) {
     return { verdict: "degraded", note: "missing_trades" };
   }
   if (metrics.delaySlowMs !== null && metrics.delaySlowMs > thresholds.slowDelayMs) {
@@ -713,7 +793,7 @@ function describeInconclusiveDetail(probe) {
   if (probe.note === "kraken_unavailable") {
     return "Біржа Kraken була недоступна, тому стан BitcoinTicker оцінити неможливо.";
   }
-  return `За цей час на біржі було лише ${probe.krakenTrades} ${tradesWord(probe.krakenTrades)} — замало для висновку. Спробуйте /check трохи пізніше.`;
+  return "За час перевірки Kraken не передав жодної угоди, тому порівнювати нема чого. Спробуйте /check трохи пізніше.";
 }
 
 // One sentence with the concrete numbers behind a bad verdict, shared by
@@ -1163,9 +1243,8 @@ async function pollTelegramCommands() {
         }
       }
     } else if (command === "/check" || command === "check") {
-      // Deliberately not awaited: the probe takes ~90s and command polling
-      // must keep running meanwhile. The activeProbe guard inside prevents
-      // a second probe from starting.
+      // Deliberately not awaited: command polling must stay responsive during
+      // the whole probe. The activeProbe guard prevents a second probe.
       runManualCheck(chatId).catch((error) => {
         console.error("Manual check failed:", error.message);
       });
