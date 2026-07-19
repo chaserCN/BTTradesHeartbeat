@@ -105,16 +105,6 @@ console.log(
     `${config.dryRun ? " DRY_RUN: Telegram messages go to console." : ""}`,
 );
 
-if (!kvGet("initializedAt")) {
-  kvSet("initializedAt", new Date().toISOString());
-  await notify(
-    "Бот моніторингу стрічки угод запущено.\n\n" +
-      `Раз на ${Math.round(config.probeIntervalMs / 60_000)} хв порівнюю наш сервер угод із біржею Kraken. ` +
-      "Напишу, якщо сервер зупиниться або почне відставати. Команди: /stats — поточний стан, /day — підсумок за добу, /check — перевірити зараз, /details — деталі останньої перевірки.",
-    { ignoreQuietHours: true },
-  );
-}
-
 // Command polling starts before the first probe: the initial probe takes
 // ~90s and commands must be answered during it, not after.
 if (!config.runOnce) {
@@ -571,7 +561,6 @@ function importLegacyJsonState() {
     }
     if (legacy.telegramUpdateOffset != null) kvSet("telegramUpdateOffset", legacy.telegramUpdateOffset);
     if (legacy.lastNotifiedVerdict) kvSet("lastNotifiedVerdict", legacy.lastNotifiedVerdict);
-    if (legacy.initializedAt) kvSet("initializedAt", legacy.initializedAt);
     console.log(`Imported ${(legacy.history || []).length} probes from legacy JSON state.`);
   }
 
