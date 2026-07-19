@@ -17,7 +17,7 @@ Each probe ends with one verdict:
 
 A first `down`/`degraded` probe is re-checked once after `CONFIRM_DELAY_SECONDS` before the chat is alerted, so a one-off network hiccup does not page anyone.
 
-Notifications are sent only when the verdict changes (worked → broke, broke → recovered). Trades are matched between the two feeds by price + quantity; feed timestamps are not used because they have one-second resolution.
+Outside quiet hours, every `down`/`degraded` result sends a notification. An `ok` result sends a notification only when the last notified state was a problem (broke → recovered). Trades are matched between the two feeds by price + quantity; feed timestamps are not used because they have one-second resolution.
 
 ## Quiet hours
 

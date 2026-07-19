@@ -153,7 +153,7 @@ async function heartbeatCycle() {
       recordProbe(probe);
     }
 
-    await maybeNotifyVerdictChange(probe);
+    await maybeNotifyVerdict(probe);
   } finally {
     activeProbe = null;
   }
@@ -569,15 +569,17 @@ function importLegacyJsonState() {
 
 // --- notifications ---------------------------------------------------------
 
-// Sends a message when the verdict changes vs. the last *notified* verdict.
+// Sends every degraded/down result and sends ok only when recovering from the
+// last *notified* problem verdict.
 // During quiet hours nothing is sent and lastNotifiedVerdict stays unchanged,
 // so the first probe after quiet hours delivers the catch-up automatically.
 // "inconclusive" probes never notify and never reset the notified verdict.
-async function maybeNotifyVerdictChange(probe) {
+async function maybeNotifyVerdict(probe) {
   if (probe.verdict !== "ok" && probe.verdict !== "degraded" && probe.verdict !== "down") return;
 
   const lastNotified = kvGet("lastNotifiedVerdict") || "ok";
-  if (probe.verdict === lastNotified) return;
+  const isProblem = probe.verdict === "degraded" || probe.verdict === "down";
+  if (!isProblem && probe.verdict === lastNotified) return;
 
   if (isQuietHours()) {
     console.log(`Quiet hours: holding back "${probe.verdict}" notification (last notified: "${lastNotified}").`);
