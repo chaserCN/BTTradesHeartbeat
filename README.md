@@ -13,9 +13,11 @@ Each probe ends with one verdict:
 - `ok` — the feed delivered the trades Kraken showed, with normal delay.
 - `degraded` — less than 80% of trades arrived, or the slowest trades took more than 5 seconds, or the feed dropped the socket mid-probe.
 - `down` — could not connect, or Kraken showed trades and the feed delivered none.
-- `inconclusive` — the market was too quiet to judge (fewer than 3 reference trades even after extending the window), or Kraken itself was unreachable. Never triggers a notification.
+- `inconclusive` — the market was too quiet to judge (fewer than 3 reference trades even after extending the window), Kraken was unreachable, or its connection broke during the probe.
 
 A first `down`/`degraded` probe is re-checked once after `CONFIRM_DELAY_SECONDS` before the chat is alerted, so a one-off network hiccup does not page anyone.
+
+If the Kraken reference is unavailable or disconnects, the bot records the reason and retries once after `CONFIRM_DELAY_SECONDS`. If the retry also fails, it warns the chat outside quiet hours that BitcoinTicker could not be checked; it never labels the app feed `down` from an incomplete reference.
 
 Outside quiet hours, every `down`/`degraded` result sends a notification. An `ok` result sends a notification only when the last notified state was a problem (broke → recovered). Trades are matched between the two feeds by price + quantity; feed timestamps are not used because they have one-second resolution.
 
@@ -66,7 +68,7 @@ No dependencies — the bot uses Node's built-in `WebSocket`, `fetch`, and `node
 SQLite via Node's built-in `node:sqlite` (needs Node ≥ 22.13; still zero npm dependencies). The database `heartbeat.db` has three tables:
 
 - `probes` — one row per probe; the row id is the permanent probe number shown in `/day` and accepted by `/details`.
-- `lost_trades` — one row per lost trade, linked to its probe.
+- `trades` — every reference trade with its delivered/lost status, linked to its probe.
 - `kv` — service state: Telegram update offset, last notified verdict, first-run marker.
 
 History is never trimmed, so long-term patterns (which hours degrade, whether it worsens over weeks) stay queryable with plain SQL. On first run the bot imports an existing pre-SQLite `heartbeat_state.json` (preserving probe numbers) and renames it to `.imported`.

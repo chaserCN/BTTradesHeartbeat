@@ -143,6 +143,15 @@ async function heartbeatCycle() {
     let probe = await runProbe();
     recordProbe(probe);
 
+    // A broken reference stream cannot be used to judge our feed. Retry once
+    // soon instead of waiting for the next hourly cycle.
+    if (isKrakenReferenceFailure(probe)) {
+      console.log(`Kraken reference failed (${probe.note}). Retrying in ${Math.round(config.confirmDelayMs / 1000)}s.`);
+      await sleep(config.confirmDelayMs);
+      probe = await runProbe();
+      recordProbe(probe);
+    }
+
     // A single bad probe can be a network hiccup on our side. Re-check once
     // after a pause before alarming the chat.
     const lastNotified = kvGet("lastNotifiedVerdict") || "ok";
@@ -245,8 +254,9 @@ function collectSession(windowMs, maxWindowMs) {
   return new Promise((resolve) => {
     const session = {
       windowMs,
+      endedAtMs: null,
       feed: { handshakeMs: null, connectFailed: false, trades: [], closes: 0, errors: 0 },
-      kraken: { connectFailed: false, trades: [] },
+      kraken: { connected: false, connectFailed: false, disconnected: false, trades: [] },
     };
 
     const startMs = Date.now();
@@ -257,7 +267,8 @@ function collectSession(windowMs, maxWindowMs) {
     const finish = () => {
       if (finished) return;
       finished = true;
-      session.windowMs = Date.now() - startMs;
+      session.endedAtMs = Date.now();
+      session.windowMs = session.endedAtMs - startMs;
       for (const socket of [feedSocket, krakenSocket]) {
         try { socket?.close(); } catch { /* already closed */ }
       }
@@ -303,9 +314,18 @@ function collectSession(windowMs, maxWindowMs) {
     }
 
     if (krakenSocket) {
+      const connectTimer = setTimeout(() => {
+        if (!session.kraken.connected) {
+          session.kraken.connectFailed = true;
+          try { krakenSocket.close(); } catch { /* ignore */ }
+        }
+      }, config.connectTimeoutMs);
+
       krakenSocket.onopen = () => {
+        clearTimeout(connectTimer);
+        session.kraken.connected = true;
         krakenSocket.send(
-          JSON.stringify({ method: "subscribe", params: { channel: "trade", symbol: [config.krakenSymbol] } }),
+          JSON.stringify({ method: "subscribe", params: { channel: "trade", symbol: [config.krakenSymbol], snapshot: false } }),
         );
       };
       krakenSocket.onmessage = (event) => {
@@ -314,7 +334,20 @@ function collectSession(windowMs, maxWindowMs) {
         }
       };
       krakenSocket.onerror = () => {
-        session.kraken.connectFailed = true;
+        if (session.kraken.connected) {
+          session.kraken.disconnected = true;
+        } else {
+          session.kraken.connectFailed = true;
+        }
+      };
+      krakenSocket.onclose = () => {
+        if (!finished) {
+          if (session.kraken.connected) {
+            session.kraken.disconnected = true;
+          } else {
+            session.kraken.connectFailed = true;
+          }
+        }
       };
     }
 
@@ -357,16 +390,10 @@ function parseKrakenTrades(raw) {
 }
 
 function computeMetrics(session) {
-  const sessionEndMs = Math.max(
-    ...session.kraken.trades.map((trade) => trade.atMs),
-    ...session.feed.trades.map((trade) => trade.atMs),
-    0,
-  );
-
   // Trades from the very end of the window may legitimately still be in
   // flight, so they do not count against coverage.
   const judgeable = session.kraken.trades.filter(
-    (trade) => trade.atMs <= sessionEndMs - thresholds.matchGraceMs,
+    (trade) => trade.atMs <= session.endedAtMs - thresholds.matchGraceMs,
   );
   const reference = judgeable.length >= thresholds.minTradesForVerdict ? judgeable : session.kraken.trades;
 
@@ -406,7 +433,12 @@ function judge(session, metrics) {
   if (session.feed.connectFailed) {
     return { verdict: "down", note: "connect_failed" };
   }
-  if (session.kraken.connectFailed && session.kraken.trades.length === 0) {
+  if (session.kraken.disconnected) {
+    // A partial reference can hide trades lost by our feed, so never judge
+    // against it even if Kraken delivered a few trades before disconnecting.
+    return { verdict: "inconclusive", note: "kraken_disconnected" };
+  }
+  if (session.kraken.connectFailed) {
     // Cannot judge without the reference. Do not blame our feed.
     return { verdict: "inconclusive", note: "kraken_unavailable" };
   }
@@ -573,8 +605,18 @@ function importLegacyJsonState() {
 // last *notified* problem verdict.
 // During quiet hours nothing is sent and lastNotifiedVerdict stays unchanged,
 // so the first probe after quiet hours delivers the catch-up automatically.
-// "inconclusive" probes never notify and never reset the notified verdict.
+// Kraken reference failures notify separately after their automatic retry but
+// never reset the last known verdict of our feed.
 async function maybeNotifyVerdict(probe) {
+  if (isKrakenReferenceFailure(probe)) {
+    if (isQuietHours()) {
+      console.log(`Quiet hours: holding back "${probe.note}" notification.`);
+      return;
+    }
+    await notify(formatKrakenReferenceFailureMessage(probe));
+    return;
+  }
+
   if (probe.verdict !== "ok" && probe.verdict !== "degraded" && probe.verdict !== "down") return;
 
   const lastNotified = kvGet("lastNotifiedVerdict") || "ok";
@@ -628,16 +670,21 @@ function formatVerdictChangeMessage(probe, previousVerdict) {
   ].join("\n");
 }
 
+function formatKrakenReferenceFailureMessage(probe) {
+  return [
+    "⚪ <b>Не вдалося перевірити стрічку угод</b>",
+    "",
+    describeInconclusiveDetail(probe),
+    "Автоматична повторна перевірка також не дала повного потоку Kraken. Стан BitcoinTicker зараз невідомий.",
+  ].join("\n");
+}
+
 function formatManualCheckMessage(probe) {
   const lines = [`Перевірка завершена (слухав ${probe.windowSeconds} с).`, ""];
   lines.push(`Стан: ${describeVerdictLine(probe)}`);
 
   if (probe.verdict === "inconclusive") {
-    if (probe.note === "kraken_unavailable") {
-      lines.push("Біржа Kraken була недоступна, тому порівняти нема з чим. Це не означає проблему з нашим сервером.");
-    } else {
-      lines.push(`За цей час на біржі було лише ${probe.krakenTrades} ${tradesWord(probe.krakenTrades)} — замало для висновку. Спробуйте /check трохи пізніше.`);
-    }
+    lines.push(describeInconclusiveDetail(probe));
     return lines.join("\n");
   }
 
@@ -653,6 +700,20 @@ function formatManualCheckMessage(probe) {
   }
 
   return lines.join("\n");
+}
+
+function isKrakenReferenceFailure(probe) {
+  return probe.note === "kraken_unavailable" || probe.note === "kraken_disconnected";
+}
+
+function describeInconclusiveDetail(probe) {
+  if (probe.note === "kraken_disconnected") {
+    return "Kraken розірвав з’єднання під час перевірки. Еталонний потік неповний, тому стан BitcoinTicker оцінити неможливо.";
+  }
+  if (probe.note === "kraken_unavailable") {
+    return "Біржа Kraken була недоступна, тому стан BitcoinTicker оцінити неможливо.";
+  }
+  return `За цей час на біржі було лише ${probe.krakenTrades} ${tradesWord(probe.krakenTrades)} — замало для висновку. Спробуйте /check трохи пізніше.`;
 }
 
 // One sentence with the concrete numbers behind a bad verdict, shared by
@@ -684,10 +745,17 @@ function formatDetailsMessages(probe) {
   const lines = [
     `${verdictEmoji(probe.verdict)} <b>Перевірка №${probe.id ?? "—"}</b> — ${detailsHeadline(probe)}`,
     `<i>${formatDateTime(probe.at)} · вікно ${probe.windowSeconds} с</i>`,
+  ];
+  if (probe.verdict === "inconclusive") {
+    lines.push("", describeInconclusiveDetail(probe));
+    return [lines.join("\n")];
+  }
+
+  lines.push(
     "",
     `Угод на біржі: ${referenceCount(probe)}`,
     `Дійшло: ${probe.matched}${probe.coveragePct !== null ? ` (${probe.coveragePct}%)` : ""}`,
-  ];
+  );
   if (probe.delayMedianMs !== null && probe.delayMedianMs !== undefined) {
     lines.push(`Затримка: зазвичай ${formatDelay(probe.delayMedianMs)}, максимум ${formatDelay(probe.delayMaxMs)}`);
   }
@@ -779,6 +847,8 @@ function chunkRowsByLength(rows, maxLength) {
 // carries the figures — no percentages repeated here.
 function detailsHeadline(probe) {
   if (probe.verdict === "ok") return "сервер працював нормально";
+  if (probe.note === "kraken_disconnected") return "Kraken розірвав з’єднання";
+  if (probe.note === "kraken_unavailable") return "Kraken був недоступний";
   if (probe.verdict === "inconclusive") return "ринок був надто тихий, щоб оцінити";
   const label = {
     connect_failed: "сервер не відповідав",
@@ -840,6 +910,8 @@ function formatStatsMessage() {
     } else if (probe.verdict === "degraded" || probe.verdict === "down") {
       const detail = describeProblemDetail(probe);
       if (detail) lines.push(detail);
+    } else if (probe.verdict === "inconclusive") {
+      lines.push(describeInconclusiveDetail(probe));
     }
   }
 
@@ -874,10 +946,15 @@ function formatDayMessage() {
   const problems = byVerdict.degraded + byVerdict.down;
 
   if (problems === 0) {
-    const quietNote = byVerdict.inconclusive
-      ? ` Ще ${byVerdict.inconclusive} ${checksWord(byVerdict.inconclusive)} припали на тихий ринок і не показові.`
-      : "";
-    lines.push(`🟢 Проблем не було: сервер працював нормально всі ${byVerdict.ok} ${checksWord(byVerdict.ok)}.${quietNote}`);
+    const quietChecks = entries.filter((entry) => entry.note === "quiet_market").length;
+    const krakenFailures = entries.filter((entry) => isKrakenReferenceFailure(entry)).length;
+    const notes = [];
+    if (quietChecks > 0) notes.push(`${quietChecks} ${checksWord(quietChecks)} припали на тихий ринок.`);
+    if (krakenFailures > 0) notes.push(`${krakenFailures} ${checksWord(krakenFailures)} не дали результату через Kraken.`);
+    const headline = byVerdict.ok > 0
+      ? `🟢 Проблем не було: сервер працював нормально всі ${byVerdict.ok} ${checksWord(byVerdict.ok)}.`
+      : "⚪ Стан сервера за цей період підтвердити не вдалося.";
+    lines.push([headline, ...notes].join(" "));
   } else {
     lines.push(`Перевірок: ${entries.length}, з них із проблемами: ${problems}.`);
   }
@@ -892,11 +969,7 @@ function formatDayMessage() {
   for (const entry of shown) {
     let line = `№${entry.id} ${formatTimeShort(Date.parse(entry.at))} ${verdictEmoji(entry.verdict)}`;
     const summary = probeProblemSummary(entry);
-    if (summary) {
-      line += ` ${summary}`;
-    } else if (entry.verdict === "inconclusive") {
-      line += " тихий ринок";
-    }
+    if (summary) line += ` ${summary}`;
     lines.push(line);
   }
   lines.push("", "Подробиці будь-якої перевірки: /details номер.");
@@ -925,6 +998,8 @@ function describeVerdictLine(probe) {
         ? "🔴 сервер недоступний (не вдалося підключитися)."
         : "🔴 сервер не передає угоди.";
     default:
+      if (probe.note === "kraken_disconnected") return "⚪ стан невідомий: Kraken розірвав з’єднання.";
+      if (probe.note === "kraken_unavailable") return "⚪ стан невідомий: Kraken недоступний.";
       return "⚪ ринок був надто тихий, щоб оцінити (мало угод на біржі).";
   }
 }
@@ -943,6 +1018,12 @@ function probeProblemSummary(entry) {
       return `затримки до ${formatDelay(entry.delaySlowMs ?? entry.delayMaxMs)}`;
     case "socket_dropped":
       return "обривалося з'єднання";
+    case "kraken_disconnected":
+      return "Kraken розірвав з’єднання";
+    case "kraken_unavailable":
+      return "Kraken був недоступний";
+    case "quiet_market":
+      return "тихий ринок";
     default:
       return null;
   }
