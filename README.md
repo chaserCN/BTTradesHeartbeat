@@ -36,6 +36,25 @@ Restricted to `TELEGRAM_CHAT_ID` (this bot lives in its own group, separate from
 - `/check` — run a probe right now and reply with the result (normally under two minutes including setup and delivery drain). While any probe is running, repeated `/check` commands are not processed: the first duplicate gets a short "already running" notice, the rest are dropped, and the scheduled hourly probe also never overlaps a manual one.
 - `/details` — full breakdown of the last probe: counts, delays, handshake time, and the list of lost trades (exchange-side time, price × quantity, up to 20 shown / 30 stored) with a burst-vs-scattered pattern hint for debugging the feed server. `/details 47` (also `№47`) shows the same for any probe number from `/day`; probe numbers are permanent.
 
+## Read-only HTTP API
+
+Telegram commands answer fixed questions; the API exists for ad-hoc ones ("which hours degrade", "is coverage getting worse over weeks") without adding a command each time. It starts only when `API_TOKEN` is set and a port is available (`PORT` on Railway, `API_PORT` locally), and it never writes: queries run on a separate SQLite connection opened read-only.
+
+Authenticate with `Authorization: Bearer $API_TOKEN` or `?token=$API_TOKEN`.
+
+- `GET /health` — no auth, for Railway's healthcheck: uptime plus the last probe's time and verdict.
+- `GET /api/stats` — current state, quiet hours, next probe, verdict totals over all history, last probe.
+- `GET /api/probes?hours=24&limit=100&verdict=degraded,down` — probe rows, newest first. `since=<ISO>` instead of `hours`; `verdict` takes a comma-separated list.
+- `GET /api/probes/<№>` — one probe with all its trades (delivered and lost). Same numbering as `/day` and `/details`.
+- `GET /api/sql?q=SELECT...` (or the query as a POST body) — any single `SELECT`/`WITH` over `probes`, `trades`, `kv`. Anything else is rejected, and at most 5000 rows come back.
+
+```sh
+curl -s -H "Authorization: Bearer $API_TOKEN" \
+  "$BASE/api/sql?q=$(printf %s "SELECT substr(at,12,2) AS hour, COUNT(*) n, AVG(coverage_pct) cov FROM probes GROUP BY hour ORDER BY cov" | jq -sRr @uri)"
+```
+
+The token is the only thing protecting the history, so treat it like the bot token: set it in Railway Variables, never commit it.
+
 ## Local setup
 
 ```sh

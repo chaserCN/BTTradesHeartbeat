@@ -1,4 +1,6 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
+import http from "node:http";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
@@ -27,6 +29,10 @@ const config = {
   dbFile: resolveDbFile(),
   runOnce: process.env.RUN_ONCE === "true",
   dryRun: process.env.DRY_RUN === "true",
+  // Read-only HTTP API over the collected history. Disabled unless API_TOKEN
+  // is set; Railway injects PORT for the public domain.
+  apiToken: process.env.API_TOKEN || "",
+  apiPort: Number(process.env.PORT || process.env.API_PORT || 0),
 };
 
 // Degradation thresholds. Healthy baseline measured 2026-07-19: the feed relays
@@ -90,6 +96,14 @@ if (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = '
 
 importLegacyJsonState();
 
+// A second, read-only connection to the same file, used only by the HTTP API.
+// Declared here rather than in the API section because the server starts
+// before the top-level `await heartbeatCycle()` below, and anything declared
+// after that await is still in its temporal dead zone while the first probe
+// runs — an early request would throw.
+const SQL_ROW_LIMIT = 5_000;
+let readOnlyDb = null;
+
 const startedAt = new Date();
 
 // Only one probe may run at a time — the feed server degrades under extra
@@ -107,6 +121,10 @@ console.log(
     `drain: ${Math.round(config.probeDrainMs / 1000)}s.` +
     `${config.dryRun ? " DRY_RUN: Telegram messages go to console." : ""}`,
 );
+
+if (!config.runOnce) {
+  startApiServer();
+}
 
 // Command polling starts before the first probe and stays responsive while
 // subscriptions warm up, the reference window runs, and late trades drain.
@@ -1256,6 +1274,218 @@ async function pollTelegramCommands() {
       });
     }
   }
+}
+
+// --- read-only HTTP API ----------------------------------------------------
+// Exists so the collected history can be inspected from outside Telegram
+// (long-term patterns are easier to see with SQL than with /day). Every
+// endpoint is read-only: the writable `db` handle is never used here, queries
+// go through a separate connection opened with readOnly.
+
+function getReadOnlyDb() {
+  if (!readOnlyDb) {
+    readOnlyDb = new DatabaseSync(config.dbFile, { readOnly: true });
+  }
+  return readOnlyDb;
+}
+
+function startApiServer() {
+  if (!config.apiToken) {
+    console.log("API disabled (no API_TOKEN set).");
+    return;
+  }
+  if (!config.apiPort) {
+    console.log("API disabled (no PORT/API_PORT set).");
+    return;
+  }
+
+  const server = http.createServer((request, response) => {
+    handleApiRequest(request, response).catch((error) => {
+      sendJson(response, 500, { error: error.message });
+    });
+  });
+
+  server.on("error", (error) => {
+    console.error("API server error:", error.message);
+  });
+
+  server.listen(config.apiPort, "::", () => {
+    console.log(`API listening on port ${config.apiPort}.`);
+  });
+}
+
+async function handleApiRequest(request, response) {
+  const url = new URL(request.url, "http://localhost");
+  const route = url.pathname.replace(/\/+$/, "") || "/";
+
+  // Unauthenticated liveness probe for Railway's healthcheck.
+  if (route === "/health") {
+    const last = getLastProbe();
+    sendJson(response, 200, {
+      ok: true,
+      uptimeSeconds: Math.round((Date.now() - startedAt.getTime()) / 1000),
+      lastProbeAt: last?.at ?? null,
+      lastVerdict: last?.verdict ?? null,
+    });
+    return;
+  }
+
+  if (!isAuthorized(request, url)) {
+    sendJson(response, 401, { error: "unauthorized" });
+    return;
+  }
+
+  if (route === "/api/stats") {
+    const last = getLastProbe();
+    const counts = getReadOnlyDb()
+      .prepare("SELECT verdict, COUNT(*) AS count FROM probes GROUP BY verdict")
+      .all();
+    const span = getReadOnlyDb()
+      .prepare("SELECT MIN(at) AS first, MAX(at) AS last, COUNT(*) AS total FROM probes")
+      .get();
+    sendJson(response, 200, {
+      now: new Date().toISOString(),
+      uptimeSeconds: Math.round((Date.now() - startedAt.getTime()) / 1000),
+      quietHours: { active: isQuietHours(), label: formatQuietHoursLabel(), timeZone: config.quietHoursTimeZone },
+      probeRunning: activeProbe !== null,
+      nextProbeAt: new Date((lastScheduledCycleAtMs ?? Date.now()) + config.probeIntervalMs).toISOString(),
+      history: { total: span?.total ?? 0, first: span?.first ?? null, last: span?.last ?? null },
+      verdictCounts: Object.fromEntries(counts.map((row) => [row.verdict, row.count])),
+      lastProbe: last,
+      config: {
+        feedUrl: config.feedUrl,
+        feedChannel: config.feedChannel,
+        krakenSymbol: config.krakenSymbol,
+        probeIntervalMinutes: Math.round(config.probeIntervalMs / 60_000),
+        probeWindowSeconds: Math.round(config.probeWindowMs / 1000),
+        slowDelayMs: thresholds.slowDelayMs,
+      },
+    });
+    return;
+  }
+
+  const probeMatch = /^\/api\/probes\/(\d+)$/.exec(route);
+  if (probeMatch) {
+    const probe = withTrades(getProbeById(Number(probeMatch[1])));
+    if (!probe) {
+      sendJson(response, 404, { error: "probe not found" });
+      return;
+    }
+    sendJson(response, 200, probe);
+    return;
+  }
+
+  if (route === "/api/probes") {
+    const limit = clampInt(url.searchParams.get("limit"), 100, 1, 2_000);
+    const conditions = [];
+    const parameters = [];
+
+    const hours = url.searchParams.get("hours");
+    const since = url.searchParams.get("since");
+    if (hours) {
+      conditions.push("at >= ?");
+      parameters.push(new Date(Date.now() - clampInt(hours, 24, 1, 24 * 365) * 3_600_000).toISOString());
+    } else if (since) {
+      conditions.push("at >= ?");
+      parameters.push(since);
+    }
+
+    const verdict = url.searchParams.get("verdict");
+    if (verdict) {
+      conditions.push(`verdict IN (${verdict.split(",").map(() => "?").join(", ")})`);
+      parameters.push(...verdict.split(","));
+    }
+
+    const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+    const rows = getReadOnlyDb()
+      .prepare(`SELECT * FROM probes ${where} ORDER BY id DESC LIMIT ?`)
+      .all(...parameters, limit)
+      .map(rowToProbe);
+    sendJson(response, 200, { count: rows.length, probes: rows });
+    return;
+  }
+
+  if (route === "/api/sql") {
+    const sql = url.searchParams.get("q") || (request.method === "POST" ? await readBody(request) : "");
+    runReadOnlyQuery(response, sql);
+    return;
+  }
+
+  sendJson(response, 404, {
+    error: "unknown route",
+    routes: ["/health", "/api/stats", "/api/probes", "/api/probes/:id", "/api/sql?q=SELECT..."],
+  });
+}
+
+// Arbitrary SELECTs are the point of this API — ad-hoc questions about the
+// history ("which hours degrade?") are not worth a new endpoint each. The
+// connection is read-only, so the guards below only need to keep the query
+// itself from being a statement batch or an unbounded dump.
+function runReadOnlyQuery(response, rawSql) {
+  const sql = (rawSql || "").trim().replace(/;\s*$/, "");
+  if (!sql) {
+    sendJson(response, 400, { error: "missing query (?q= or POST body)" });
+    return;
+  }
+  if (!/^(select|with)\b/i.test(sql)) {
+    sendJson(response, 400, { error: "only SELECT/WITH queries are allowed" });
+    return;
+  }
+  if (sql.includes(";")) {
+    sendJson(response, 400, { error: "only a single statement is allowed" });
+    return;
+  }
+
+  try {
+    const startedMs = Date.now();
+    const rows = getReadOnlyDb().prepare(sql).all();
+    sendJson(response, 200, {
+      rowCount: rows.length,
+      truncated: rows.length > SQL_ROW_LIMIT,
+      elapsedMs: Date.now() - startedMs,
+      rows: rows.slice(0, SQL_ROW_LIMIT),
+    });
+  } catch (error) {
+    sendJson(response, 400, { error: error.message });
+  }
+}
+
+function isAuthorized(request, url) {
+  const header = request.headers.authorization || "";
+  const provided = header.startsWith("Bearer ") ? header.slice(7) : url.searchParams.get("token") || "";
+  const expected = Buffer.from(config.apiToken);
+  const actual = Buffer.from(provided);
+  return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
+}
+
+function readBody(request) {
+  return new Promise((resolve, reject) => {
+    let body = "";
+    request.on("data", (chunk) => {
+      body += chunk;
+      if (body.length > 100_000) {
+        reject(new Error("request body too large"));
+        request.destroy();
+      }
+    });
+    request.on("end", () => resolve(body));
+    request.on("error", reject);
+  });
+}
+
+function sendJson(response, status, payload) {
+  const body = JSON.stringify(payload, null, 2);
+  response.writeHead(status, {
+    "content-type": "application/json; charset=utf-8",
+    "content-length": Buffer.byteLength(body),
+  });
+  response.end(body);
+}
+
+function clampInt(value, fallback, min, max) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(max, Math.max(min, Math.trunc(parsed)));
 }
 
 // --- storage location and env ----------------------------------------------
