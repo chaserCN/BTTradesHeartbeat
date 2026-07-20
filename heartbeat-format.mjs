@@ -25,15 +25,6 @@ export function formatDetailsMessages(probe, options = {}) {
   if (probe.handshakeMs !== null && probe.handshakeMs !== undefined) {
     lines.push(`Підключення: ${formatDelay(probe.handshakeMs)}`);
   }
-  if (probe.subscribeToFirstTradeMs !== null && probe.subscribeToFirstTradeMs !== undefined) {
-    lines.push(`Перша угода після підписки: ${formatDelay(probe.subscribeToFirstTradeMs)}`);
-  }
-  if (probe.krakenSyncTrades > 0) {
-    lines.push(
-      `Перекривний прогрів: ${probe.syncMatched} з ${probe.krakenSyncTrades}` +
-        `${probe.syncCoveragePct !== null ? ` (${probe.syncCoveragePct}%)` : ""}`,
-    );
-  }
   if (probe.measurementFeedParseFailures || probe.measurementKrakenParseFailures) {
     lines.push(
       `Помилки розбору у вікні: feed ${probe.measurementFeedParseFailures || 0}, ` +

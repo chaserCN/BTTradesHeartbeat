@@ -55,6 +55,36 @@ test("row chunking does not drop a row at an exact boundary", async () => {
   assert.deepEqual(chunkRowsByLength(["1234", "5678", "9"], 10), [["1234", "5678"], ["9"]]);
 });
 
+// Intent: pre-measurement telemetry must remain available to diagnostics
+// without leaking implementation noise into the user-facing Telegram report.
+test("details hide subscription and overlapping-warmup telemetry", () => {
+  const output = formatDetailsMessages({
+    id: 8,
+    at: "2026-07-20T09:05:00Z",
+    verdict: "ok",
+    note: "",
+    windowSeconds: 90,
+    referenceTrades: 4,
+    matched: 4,
+    coveragePct: 100,
+    delayMedianMs: 31,
+    delayMaxMs: 52,
+    handshakeMs: 10,
+    subscribeToFirstTradeMs: 14,
+    krakenSyncTrades: 3,
+    syncMatched: 2,
+    syncCoveragePct: 67,
+    measurementFeedParseFailures: 0,
+    measurementKrakenParseFailures: 0,
+    feedCloses: 0,
+    feedErrors: 0,
+    lostTrades: [],
+  }, { timeZone: "UTC" }).join("\n");
+
+  assert.doesNotMatch(output, /Перша угода після підписки|Перекривний прогрів/);
+  assert.match(output, /Загублених угод не було/);
+});
+
 test("every verdict detail variant is bounded and contains no missing placeholders", () => {
   const variants = [
     ["ok", ""],
