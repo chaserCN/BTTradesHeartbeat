@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { judgeProbe } from "./heartbeat-core.mjs";
 import { createApiHandler, sendJson } from "./heartbeat-api.mjs";
 import { isKrakenReferenceFailure, runScheduledProbeSequence } from "./heartbeat-cycle.mjs";
-import { formatDetailsMessages } from "./heartbeat-format.mjs";
+import { formatDayProbeLine, formatDetailsMessages } from "./heartbeat-format.mjs";
 import { collectSession, computeSessionMetrics } from "./heartbeat-session.mjs";
 import { createHeartbeatStore } from "./heartbeat-storage.mjs";
 import {
@@ -561,10 +561,11 @@ function formatDayMessage() {
     lines.push(`(показано лише ${shown.length} із ${entries.length})`);
   }
   for (const entry of shown) {
-    let line = `№${entry.id} ${formatTimeShort(Date.parse(entry.at))} ${verdictEmoji(entry.verdict)}`;
     const summary = probeProblemSummary(entry);
-    if (summary) line += ` ${summary}`;
-    lines.push(line);
+    lines.push(formatDayProbeLine(entry, {
+      timeZone: config.quietHoursTimeZone,
+      problemSummary: summary,
+    }));
   }
   lines.push("", "Подробиці будь-якої перевірки: /details номер.");
 
@@ -625,19 +626,6 @@ function probeProblemSummary(entry) {
       return "тихий ринок";
     default:
       return null;
-  }
-}
-
-function verdictEmoji(verdict) {
-  switch (verdict) {
-    case "ok":
-      return "🟢";
-    case "degraded":
-      return "🟠";
-    case "down":
-      return "🔴";
-    default:
-      return "⚪";
   }
 }
 

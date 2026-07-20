@@ -1,7 +1,45 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { formatDetailsMessages, TELEGRAM_MESSAGE_LIMIT } from "../heartbeat-format.mjs";
+import { formatDayProbeLine, formatDetailsMessages, TELEGRAM_MESSAGE_LIMIT } from "../heartbeat-format.mjs";
+
+// Intent: /day must make each check comparable at a glance without turning a
+// missing Kraken reference into the misleading result "0/0".
+test("day lines show delivery coverage or an explicit missing-reference state", () => {
+  assert.equal(
+    formatDayProbeLine({
+      id: 1,
+      at: "2026-07-20T14:42:40Z",
+      verdict: "ok",
+      matched: 150,
+      referenceTrades: 150,
+      coveragePct: 100,
+    }, { timeZone: "Europe/Kyiv" }),
+    "№1, 17:42: 150/150, покриття 100% 🟢",
+  );
+  assert.equal(
+    formatDayProbeLine({
+      id: 2,
+      at: "2026-07-20T14:42:40Z",
+      verdict: "degraded",
+      matched: 78,
+      referenceTrades: 100,
+      coveragePct: 78,
+    }, { timeZone: "Europe/Kyiv", problemSummary: "губилися угоди" }),
+    "№2, 17:42: 78/100, покриття 78% 🟠 — губилися угоди",
+  );
+  assert.equal(
+    formatDayProbeLine({
+      id: 3,
+      at: "2026-07-20T14:42:40Z",
+      verdict: "inconclusive",
+      matched: 0,
+      referenceTrades: 0,
+      coveragePct: null,
+    }, { timeZone: "Europe/Kyiv", problemSummary: "тихий ринок" }),
+    "№3, 17:42: немає еталонних угод ⚪ — тихий ринок",
+  );
+});
 
 // Intent: a long failed probe must reach Telegram without truncating or
 // duplicating evidence, while every emitted message stays below 4096 chars.

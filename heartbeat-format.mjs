@@ -3,6 +3,20 @@ import { formatUkCount, TRADE_NOMINATIVE_FORMS } from "./ukrainian.mjs";
 
 export const TELEGRAM_MESSAGE_LIMIT = 4_096;
 
+// Compact, comparable result used in the /day history. A missing reference is
+// deliberately shown as a diagnostic state rather than a misleading 0/0.
+export function formatDayProbeLine(probe, options = {}) {
+  const timeZone = options.timeZone ?? "Europe/Kyiv";
+  const problemSummary = options.problemSummary;
+  const prefix = `№${probe.id}, ${formatTimeShort(probe.at, timeZone)}:`;
+  const hasReference = Number.isFinite(probe.referenceTrades) && probe.referenceTrades > 0;
+  const result = hasReference
+    ? `${probe.matched ?? 0}/${probe.referenceTrades}, покриття ${probe.coveragePct ?? "—"}%`
+    : "немає еталонних угод";
+  const suffix = problemSummary ? ` — ${problemSummary}` : "";
+  return `${prefix} ${result} ${verdictEmoji(probe.verdict)}${suffix}`;
+}
+
 export function formatDetailsMessages(probe, options = {}) {
   const timeZone = options.timeZone ?? "Europe/Kyiv";
   const describeInconclusive = options.describeInconclusive ?? defaultInconclusiveDetail;
@@ -199,6 +213,15 @@ function formatTimeWithSeconds(ms, timeZone) {
     second: "2-digit",
     hour12: false,
   }).format(new Date(ms));
+}
+
+function formatTimeShort(value, timeZone) {
+  return new Intl.DateTimeFormat("uk-UA", {
+    timeZone,
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(new Date(value));
 }
 
 function formatDateTime(value, timeZone) {
