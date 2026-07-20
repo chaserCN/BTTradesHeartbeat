@@ -23,13 +23,10 @@ export function formatDetailsMessages(probe, options = {}) {
   if (probe.delayMedianMs !== null && probe.delayMedianMs !== undefined) {
     lines.push(`Затримка: зазвичай ${formatDelay(probe.delayMedianMs)}, максимум ${formatDelay(probe.delayMaxMs)}`);
   }
-  if (probe.handshakeMs !== null && probe.handshakeMs !== undefined) {
-    lines.push(`Підключення: ${formatDelay(probe.handshakeMs)}`);
-  }
-  if (probe.measurementFeedParseFailures || probe.measurementKrakenParseFailures) {
+  if (probe.deliveryHorizonFeedParseFailures || probe.referenceWindowKrakenParseFailures) {
     lines.push(
-      `Помилки розбору у вікні: feed ${probe.measurementFeedParseFailures || 0}, ` +
-        `Kraken ${probe.measurementKrakenParseFailures || 0}`,
+      `Помилки розбору: feed ${probe.deliveryHorizonFeedParseFailures || 0}, ` +
+        `Kraken ${probe.referenceWindowKrakenParseFailures || 0}`,
     );
   }
   if (probe.feedCloses || probe.feedErrors) {
@@ -182,7 +179,7 @@ function referenceCount(probe) {
 }
 
 function missingCount(probe) {
-  if (probe.coveragePct === null || probe.coveragePct === 0) return probe.krakenTrades;
+  if (probe.coveragePct === null || probe.coveragePct === 0) return probe.referenceTrades;
   return Math.max(0, Math.round((probe.matched * 100) / probe.coveragePct) - probe.matched);
 }
 

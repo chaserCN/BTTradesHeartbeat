@@ -407,15 +407,19 @@ test("verdict distinguishes feed silence from malformed messages", () => {
     referenceTrades: 2,
     feedCandidates: [],
     matched: 0,
-    feedParseFailures: 0,
-    krakenParseFailures: 0,
-    delaySlowMs: null,
+    deliveryHorizonFeedParseFailures: 0,
+    referenceWindowKrakenParseFailures: 0,
+    delayP90Ms: null,
   };
-  assert.deepEqual(judgeProbe(session, { ...baseMetrics, feedMessages: 0 }), {
+  assert.deepEqual(judgeProbe(session, { ...baseMetrics, deliveryHorizonFeedMessages: 0 }), {
     verdict: "down",
     note: "feed_silent",
   });
-  assert.deepEqual(judgeProbe(session, { ...baseMetrics, feedMessages: 2, feedParseFailures: 2 }), {
+  assert.deepEqual(judgeProbe(session, {
+    ...baseMetrics,
+    deliveryHorizonFeedMessages: 2,
+    deliveryHorizonFeedParseFailures: 2,
+  }), {
     verdict: "down",
     note: "invalid_feed_messages",
   });
@@ -430,10 +434,10 @@ test("a malformed Kraken measurement makes the verdict inconclusive", () => {
     referenceTrades: 3,
     feedCandidates: [feedTrade()],
     matched: 3,
-    feedMessages: 1,
-    feedParseFailures: 0,
-    krakenParseFailures: 1,
-    delaySlowMs: 10,
+    deliveryHorizonFeedMessages: 1,
+    deliveryHorizonFeedParseFailures: 0,
+    referenceWindowKrakenParseFailures: 1,
+    delayP90Ms: 10,
   });
   assert.deepEqual(verdict, { verdict: "inconclusive", note: "kraken_parse_failure" });
 });
@@ -449,29 +453,29 @@ test("verdict precedence and the slow threshold are exhaustive", () => {
     referenceTrades: 2,
     feedCandidates: [feedTrade()],
     matched: 2,
-    feedMessages: 1,
-    feedParseFailures: 0,
-    krakenParseFailures: 0,
-    delaySlowMs: 5_000,
+    deliveryHorizonFeedMessages: 1,
+    deliveryHorizonFeedParseFailures: 0,
+    referenceWindowKrakenParseFailures: 0,
+    delayP90Ms: 5_000,
   };
   const cases = [
     [
       { ...healthySession, feed: { ...healthySession.feed, connectFailed: true }, kraken: { connectFailed: true, disconnected: true } },
-      { ...healthyMetrics, krakenParseFailures: 1 },
+      { ...healthyMetrics, referenceWindowKrakenParseFailures: 1 },
       ["down", "connect_failed"],
     ],
     [{ ...healthySession, kraken: { ...healthySession.kraken, disconnected: true } }, healthyMetrics, ["inconclusive", "kraken_disconnected"]],
     [{ ...healthySession, kraken: { ...healthySession.kraken, connectFailed: true } }, healthyMetrics, ["inconclusive", "kraken_unavailable"]],
-    [healthySession, { ...healthyMetrics, krakenParseFailures: 1 }, ["inconclusive", "kraken_parse_failure"]],
+    [healthySession, { ...healthyMetrics, referenceWindowKrakenParseFailures: 1 }, ["inconclusive", "kraken_parse_failure"]],
     [healthySession, { ...healthyMetrics, referenceTrades: 0 }, ["inconclusive", "quiet_market"]],
-    [healthySession, { ...healthyMetrics, feedCandidates: [], matched: 0, feedMessages: 0 }, ["down", "feed_silent"]],
-    [healthySession, { ...healthyMetrics, feedCandidates: [], matched: 0, feedMessages: 1 }, ["down", "invalid_feed_messages"]],
+    [healthySession, { ...healthyMetrics, feedCandidates: [], matched: 0, deliveryHorizonFeedMessages: 0 }, ["down", "feed_silent"]],
+    [healthySession, { ...healthyMetrics, feedCandidates: [], matched: 0, deliveryHorizonFeedMessages: 1 }, ["down", "invalid_feed_messages"]],
     [healthySession, { ...healthyMetrics, matched: 0 }, ["down", "no_matches"]],
-    [{ ...healthySession, feed: { ...healthySession.feed, closes: 1 } }, { ...healthyMetrics, feedParseFailures: 1, matched: 1 }, ["degraded", "socket_dropped"]],
+    [{ ...healthySession, feed: { ...healthySession.feed, closes: 1 } }, { ...healthyMetrics, deliveryHorizonFeedParseFailures: 1, matched: 1 }, ["degraded", "socket_dropped"]],
     [{ ...healthySession, feed: { ...healthySession.feed, errors: 1 } }, healthyMetrics, ["degraded", "socket_dropped"]],
-    [healthySession, { ...healthyMetrics, feedParseFailures: 1, matched: 1 }, ["degraded", "invalid_feed_messages"]],
-    [healthySession, { ...healthyMetrics, matched: 1, delaySlowMs: 9_000 }, ["degraded", "missing_trades"]],
-    [healthySession, { ...healthyMetrics, delaySlowMs: 5_001 }, ["degraded", "slow_delivery"]],
+    [healthySession, { ...healthyMetrics, deliveryHorizonFeedParseFailures: 1, matched: 1 }, ["degraded", "invalid_feed_messages"]],
+    [healthySession, { ...healthyMetrics, matched: 1, delayP90Ms: 9_000 }, ["degraded", "missing_trades"]],
+    [healthySession, { ...healthyMetrics, delayP90Ms: 5_001 }, ["degraded", "slow_delivery"]],
     [healthySession, healthyMetrics, ["ok", ""]],
   ];
   for (const [session, metrics, expected] of cases) {

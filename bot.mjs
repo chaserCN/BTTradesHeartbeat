@@ -199,7 +199,6 @@ async function runManualCheck(chatId) {
 // channels, so a quiet market and a dead feed look identical from our socket
 // alone — Kraken's own stream is the reference that tells them apart.
 async function runProbe() {
-  const startedAtMs = Date.now();
   const session = await collectSession({
     windowMs: config.probeWindowMs,
     warmupMs: config.probeWarmupMs,
@@ -215,13 +214,12 @@ async function runProbe() {
     drainMs: config.probeDrainMs,
   });
   const verdict = judgeProbe(session, metrics, thresholds.slowDelayMs);
-  const measurementStartedAt = session.measurementStartedAtMs === null
-    ? null
-    : new Date(session.measurementStartedAtMs).toISOString();
-  const feedWarmupTrades = session.feed.trades.filter(
+  const feedPreMeasurementTrades = session.feed.trades.filter(
     (trade) => session.measurementStartedMonoMs !== null && trade.receivedMonoMs < session.measurementStartedMonoMs,
   ).length;
   const feedSyncTrades = session.feed.trades.filter((trade) => trade.phase === "syncing").length;
+  const feedMeasurementTrades = session.feed.trades.filter((trade) => trade.phase === "measuring").length;
+  const feedDrainTrades = session.feed.trades.filter((trade) => trade.phase === "draining").length;
   const measurementMatchedSequences = new Set(
     metrics.allTrades.map((trade) => trade.matchedFeedSequence).filter((value) => value !== null),
   );
@@ -233,40 +231,59 @@ async function runProbe() {
   );
 
   const probe = {
-    at: new Date(startedAtMs).toISOString(),
-    measurementStartedAt,
+    at: new Date(session.startedAtMs).toISOString(),
+    startedAtMs: session.startedAtMs,
+    startedMonoMs: session.startedMonoMs,
+    feedSubscribedAtMs: session.feed.subscribedAtMs,
+    feedSubscribedMonoMs: session.feed.subscribedAtMonoMs,
+    firstFeedMessageAtMs: session.feed.firstMessageAtMs,
+    firstFeedMessageMonoMs: session.feed.firstMessageAtMonoMs,
+    firstFeedTradeAtMs: session.feed.firstTradeAtMs,
+    firstFeedTradeMonoMs: session.feed.firstTradeAtMonoMs,
+    krakenSubscribedAtMs: session.kraken.subscribedAtMs,
+    krakenSubscribedMonoMs: session.kraken.subscribedAtMonoMs,
+    measurementStartedAtMs: session.measurementStartedAtMs,
     measurementStartedMonoMs: session.measurementStartedMonoMs,
+    measurementEndedAtMs: session.referenceEndedAtMs,
+    measurementEndedMonoMs: session.referenceEndedMonoMs,
+    sessionEndedAtMs: session.endedAtMs,
+    sessionEndedMonoMs: session.endedAtMonoMs,
     verdict: verdict.verdict,
     note: verdict.note,
+    windowMs: session.windowMs,
     windowSeconds: Math.round(session.windowMs / 1000),
     handshakeMs: session.feed.handshakeMs,
     subscribeToFirstMessageMs: session.feed.subscribeToFirstMessageMs,
     subscribeToFirstTradeMs: session.feed.subscribeToFirstTradeMs,
     feedMessages: session.feed.messages,
     feedParseFailures: session.feed.parseFailures,
-    measurementFeedMessages: metrics.feedMessages,
-    measurementFeedParseFailures: metrics.feedParseFailures,
+    deliveryHorizonFeedMessages: metrics.deliveryHorizonFeedMessages,
+    deliveryHorizonFeedParseFailures: metrics.deliveryHorizonFeedParseFailures,
     feedParsedTrades: session.feed.trades.length,
-    feedWarmupTrades,
+    feedPreMeasurementTrades,
     feedSyncTrades,
+    feedMeasurementTrades,
+    feedDrainTrades,
     krakenMessages: session.kraken.messages,
     krakenParseFailures: session.kraken.parseFailures,
-    measurementKrakenParseFailures: metrics.krakenParseFailures,
+    referenceWindowKrakenParseFailures: metrics.referenceWindowKrakenParseFailures,
     krakenSyncTrades: metrics.sync.referenceTrades,
+    krakenDrainTrades: metrics.drain.referenceTrades,
     syncMatched: metrics.sync.matched,
     syncCoveragePct: metrics.sync.coveragePct,
-    krakenTrades: metrics.referenceTrades,
-    ourTrades: metrics.feedCandidates.length,
+    feedCandidateTrades: metrics.feedCandidates.length,
     referenceTrades: metrics.referenceTrades,
     matched: metrics.matched,
     coveragePct: metrics.coveragePct,
     delayMedianMs: metrics.delayMedianMs,
-    delaySlowMs: metrics.delaySlowMs,
+    delayP90Ms: metrics.delayP90Ms,
     delayMaxMs: metrics.delayMaxMs,
     signedDelayMinMs: metrics.signedDelayMinMs,
     signedDelayMedianMs: metrics.signedDelayMedianMs,
     feedCloses: session.feed.closes,
     feedErrors: session.feed.errors,
+    krakenCloses: session.kraken.closes,
+    krakenErrors: session.kraken.errors,
     // Every measurement and sync reference trade is retained. Every parsed
     // feed trade is retained too, including unmatched warmup/drain records.
     trades: metrics.allTrades,
@@ -275,6 +292,10 @@ async function runProbe() {
     messageEvents: [
       ...session.feed.events.map((event) => ({ ...event, source: "feed" })),
       ...session.kraken.events.map((event) => ({ ...event, source: "kraken" })),
+    ],
+    socketEvents: [
+      ...session.feed.socketEvents.map((event) => ({ ...event, source: "feed" })),
+      ...session.kraken.socketEvents.map((event) => ({ ...event, source: "kraken" })),
     ],
     feedTrades: session.feed.trades.map((trade) => ({
       ...trade,
@@ -428,15 +449,15 @@ function describeProblemDetail(probe) {
       return "Сервер не відповідає: не вдалося встановити з'єднання.";
     case "feed_silent":
     case "no_matches":
-      return probe.ourTrades > 0
-        ? `Біржа показала ${formatUkCount(probe.krakenTrades, TRADE_ACCUSATIVE_FORMS)}, ` +
-          `сервер надіслав ${formatUkCount(probe.ourTrades, MESSAGE_ACCUSATIVE_FORMS)}, ` +
+      return probe.feedCandidateTrades > 0
+        ? `Біржа показала ${formatUkCount(probe.referenceTrades, TRADE_ACCUSATIVE_FORMS)}, ` +
+          `з фіда отримано ${formatUkCount(probe.feedCandidateTrades, TRADE_ACCUSATIVE_FORMS)}, ` +
           "але реальних угод з біржі серед них немає — дані не збігаються."
-        : `Біржа показала ${formatUkCount(probe.krakenTrades, TRADE_ACCUSATIVE_FORMS)} ` +
+        : `Біржа показала ${formatUkCount(probe.referenceTrades, TRADE_ACCUSATIVE_FORMS)} ` +
           `за ${probe.windowSeconds} с, наш сервер не передав жодної.`;
     case "invalid_feed_messages":
-      return `Фід надіслав ${formatUkCount(probe.measurementFeedMessages, MESSAGE_ACCUSATIVE_FORMS)}, ` +
-        `але ${probe.measurementFeedParseFailures} з них не вдалося розібрати. ` +
+      return `Фід надіслав ${formatUkCount(probe.deliveryHorizonFeedMessages, MESSAGE_ACCUSATIVE_FORMS)}, ` +
+        `але ${probe.deliveryHorizonFeedParseFailures} з них не вдалося розібрати. ` +
         "Дані фіда пошкоджені або змінили формат.";
     case "socket_dropped":
       return `Сервер обривав з'єднання під час перевірки. ` +
@@ -445,7 +466,7 @@ function describeProblemDetail(probe) {
       return `Частина угод губиться. Дійшло: ${probe.matched} із ${total} (${probe.coveragePct}%). ` +
         `Ті, що дійшли, долітали зазвичай за ${formatDelay(probe.delayMedianMs)}.`;
     case "slow_delivery":
-      return `Угоди доходять (${probe.coveragePct}%), але повільно: зазвичай за ${formatDelay(probe.delayMedianMs)}, найповільніші — за ${formatDelay(probe.delaySlowMs)}. У нормі — менш ніж пів секунди.`;
+      return `Угоди доходять (${probe.coveragePct}%), але повільно: зазвичай за ${formatDelay(probe.delayMedianMs)}, найповільніші — за ${formatDelay(probe.delayP90Ms)}. У нормі — менш ніж пів секунди.`;
     default:
       return null;
   }
@@ -591,7 +612,7 @@ function probeProblemSummary(entry) {
     case "missing_trades":
       return `губилися угоди (дійшло ${entry.coveragePct}%)`;
     case "slow_delivery":
-      return `затримки до ${formatDelay(entry.delaySlowMs ?? entry.delayMaxMs)}`;
+      return `затримки до ${formatDelay(entry.delayP90Ms ?? entry.delayMaxMs)}`;
     case "socket_dropped":
       return "обривалося з'єднання";
     case "kraken_disconnected":
@@ -627,7 +648,7 @@ function referenceCount(probe) {
 }
 
 function missingCount(probe) {
-  if (probe.coveragePct === null || probe.coveragePct === 0) return probe.krakenTrades;
+  if (probe.coveragePct === null || probe.coveragePct === 0) return probe.referenceTrades;
   return Math.max(0, Math.round((probe.matched * 100) / probe.coveragePct) - probe.matched);
 }
 

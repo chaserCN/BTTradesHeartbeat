@@ -30,8 +30,8 @@ test("details chunking preserves every trade exactly once under Telegram's limit
     krakenSyncTrades: 3,
     syncMatched: 3,
     syncCoveragePct: 100,
-    measurementFeedParseFailures: 0,
-    measurementKrakenParseFailures: 0,
+    deliveryHorizonFeedParseFailures: 0,
+    referenceWindowKrakenParseFailures: 0,
     feedCloses: 0,
     feedErrors: 0,
     trades,
@@ -57,7 +57,7 @@ test("row chunking does not drop a row at an exact boundary", async () => {
 
 // Intent: pre-measurement telemetry must remain available to diagnostics
 // without leaking implementation noise into the user-facing Telegram report.
-test("details hide subscription and overlapping-warmup telemetry", () => {
+test("details hide internal lifecycle telemetry", () => {
   const output = formatDetailsMessages({
     id: 8,
     at: "2026-07-20T09:05:00Z",
@@ -74,14 +74,14 @@ test("details hide subscription and overlapping-warmup telemetry", () => {
     krakenSyncTrades: 3,
     syncMatched: 2,
     syncCoveragePct: 67,
-    measurementFeedParseFailures: 0,
-    measurementKrakenParseFailures: 0,
+    deliveryHorizonFeedParseFailures: 0,
+    referenceWindowKrakenParseFailures: 0,
     feedCloses: 0,
     feedErrors: 0,
     lostTrades: [],
   }, { timeZone: "UTC" }).join("\n");
 
-  assert.doesNotMatch(output, /Перша угода після підписки|Перекривний прогрів/);
+  assert.doesNotMatch(output, /Підключення|Перша угода після підписки|Перекривний прогрів/);
   assert.match(output, /Загублених угод не було/);
 });
 
@@ -106,8 +106,8 @@ test("a single loss uses the nominative Ukrainian form", () => {
     delayMedianMs: 30,
     delayMaxMs: 30,
     handshakeMs: 10,
-    measurementFeedParseFailures: 0,
-    measurementKrakenParseFailures: 0,
+    deliveryHorizonFeedParseFailures: 0,
+    referenceWindowKrakenParseFailures: 0,
     feedCloses: 0,
     feedErrors: 0,
     trades,
@@ -140,7 +140,6 @@ test("every verdict detail variant is bounded and contains no missing placeholde
       note,
       windowSeconds: 90,
       referenceTrades: 2,
-      krakenTrades: 2,
       matched: verdict === "ok" ? 2 : 1,
       coveragePct: verdict === "ok" ? 100 : 50,
       delayMedianMs: 31,
@@ -150,8 +149,8 @@ test("every verdict detail variant is bounded and contains no missing placeholde
       krakenSyncTrades: 1,
       syncMatched: 1,
       syncCoveragePct: 100,
-      measurementFeedParseFailures: note === "invalid_feed_messages" ? 1 : 0,
-      measurementKrakenParseFailures: note === "kraken_parse_failure" ? 1 : 0,
+      deliveryHorizonFeedParseFailures: note === "invalid_feed_messages" ? 1 : 0,
+      referenceWindowKrakenParseFailures: note === "kraken_parse_failure" ? 1 : 0,
       feedCloses: note === "socket_dropped" ? 1 : 0,
       feedErrors: 0,
       lostTrades: [],

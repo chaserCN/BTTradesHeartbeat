@@ -26,6 +26,9 @@ export function collectSession(options, dependencies = {}) {
   return new Promise((resolve) => {
     const session = emptySession();
     const connectionStartedAtMs = wallNow();
+    const connectionStartedMonoMs = monoNow();
+    session.startedAtMs = connectionStartedAtMs;
+    session.startedMonoMs = connectionStartedMonoMs;
     let finished = false;
     let phase = "connecting_feed";
     let feedSocket = null;
@@ -36,6 +39,21 @@ export function collectSession(options, dependencies = {}) {
     let syncTimer = null;
     let measurementTimer = null;
     let drainTimer = null;
+
+    const recordSocketEvent = (source, eventType, details = {}, times = {}) => {
+      const events = session[source].socketEvents;
+      events.push({
+        sequence: events.length + 1,
+        eventType,
+        phase,
+        occurredAtMs: times.occurredAtMs ?? wallNow(),
+        occurredMonoMs: times.occurredMonoMs ?? monoNow(),
+        code: details.code ?? null,
+        reason: details.reason ?? null,
+        wasClean: details.wasClean ?? null,
+        detail: details.detail ?? null,
+      });
+    };
 
     const finish = () => {
       if (finished) return;
@@ -84,7 +102,8 @@ export function collectSession(options, dependencies = {}) {
 
       try {
         krakenSocket = new WebSocketClass(krakenUrl);
-      } catch {
+      } catch (error) {
+        recordSocketEvent("kraken", "constructor_error", { detail: diagnosticDetail(error) });
         session.kraken.connectFailed = true;
         finish();
         return;
@@ -93,6 +112,7 @@ export function collectSession(options, dependencies = {}) {
       // Includes both the WebSocket handshake and subscription acknowledgement.
       krakenConnectTimer = setTimer(() => {
         if (phase === "connecting_kraken") {
+          recordSocketEvent("kraken", "timeout");
           session.kraken.connectFailed = true;
           finish();
         }
@@ -100,11 +120,20 @@ export function collectSession(options, dependencies = {}) {
 
       krakenSocket.onopen = () => {
         if (finished) return;
+        recordSocketEvent("kraken", "open");
         session.kraken.connected = true;
-        krakenSocket.send(JSON.stringify({
-          method: "subscribe",
-          params: { channel: "trade", symbol: [krakenSymbol], snapshot: false },
-        }));
+        try {
+          krakenSocket.send(JSON.stringify({
+            method: "subscribe",
+            params: { channel: "trade", symbol: [krakenSymbol], snapshot: false },
+          }));
+        } catch (error) {
+          recordSocketEvent("kraken", "subscribe_send_error", { detail: diagnosticDetail(error) });
+          session.kraken.connectFailed = true;
+          finish();
+          return;
+        }
+        recordSocketEvent("kraken", "subscribe_sent");
       };
       krakenSocket.onmessage = (event) => {
         if (finished) return;
@@ -126,11 +155,23 @@ export function collectSession(options, dependencies = {}) {
           clearTimer(krakenConnectTimer);
           session.syncStartedAtMs = receivedAtMs;
           session.syncStartedMonoMs = receivedMonoMs;
+          session.kraken.subscribedAtMs = receivedAtMs;
+          session.kraken.subscribedAtMonoMs = receivedMonoMs;
+          recordSocketEvent("kraken", "subscribe_accepted", {}, {
+            occurredAtMs: receivedAtMs,
+            occurredMonoMs: receivedMonoMs,
+          });
           phase = "syncing";
           syncTimer = setTimer(beginMeasurement, warmupMs);
           return;
         }
         if (message.subscription === "rejected") {
+          recordSocketEvent("kraken", "subscribe_rejected", {
+            detail: diagnosticDetail(message.error),
+          }, {
+            occurredAtMs: receivedAtMs,
+            occurredMonoMs: receivedMonoMs,
+          });
           session.kraken.connectFailed = true;
           logError(`Kraken subscription failed: ${message.error || "unknown error"}`);
           finish();
@@ -140,8 +181,10 @@ export function collectSession(options, dependencies = {}) {
           session.kraken.trades.push(...message.trades.map((trade) => ({ ...trade, phase })));
         }
       };
-      krakenSocket.onerror = () => {
+      krakenSocket.onerror = (event) => {
         if (finished) return;
+        session.kraken.errors += 1;
+        recordSocketEvent("kraken", "error", { detail: diagnosticDetail(event?.message ?? event?.error) });
         if (phase === "connecting_kraken") {
           session.kraken.connectFailed = true;
           finish();
@@ -150,8 +193,11 @@ export function collectSession(options, dependencies = {}) {
           finish();
         }
       };
-      krakenSocket.onclose = () => {
-        if (finished || phase === "draining") return;
+      krakenSocket.onclose = (event) => {
+        if (finished) return;
+        session.kraken.closes += 1;
+        recordSocketEvent("kraken", "close", closeDetails(event));
+        if (phase === "draining") return;
         if (phase === "connecting_kraken") {
           session.kraken.connectFailed = true;
         } else if (phase === "syncing" || phase === "measuring") {
@@ -163,7 +209,8 @@ export function collectSession(options, dependencies = {}) {
 
     try {
       feedSocket = new WebSocketClass(feedUrl);
-    } catch {
+    } catch (error) {
+      recordSocketEvent("feed", "constructor_error", { detail: diagnosticDetail(error) });
       session.feed.connectFailed = true;
       finish();
       return;
@@ -171,6 +218,7 @@ export function collectSession(options, dependencies = {}) {
 
     feedConnectTimer = setTimer(() => {
       if (session.feed.handshakeMs === null) {
+        recordSocketEvent("feed", "timeout");
         session.feed.connectFailed = true;
         finish();
       }
@@ -179,10 +227,27 @@ export function collectSession(options, dependencies = {}) {
     feedSocket.onopen = () => {
       if (finished) return;
       clearTimer(feedConnectTimer);
-      session.feed.handshakeMs = wallNow() - connectionStartedAtMs;
+      const openedAtMs = wallNow();
+      const openedMonoMs = monoNow();
+      session.feed.handshakeMs = Math.round(openedMonoMs - connectionStartedMonoMs);
+      recordSocketEvent("feed", "open", {}, {
+        occurredAtMs: openedAtMs,
+        occurredMonoMs: openedMonoMs,
+      });
       session.feed.subscribedAtMs = wallNow();
       session.feed.subscribedAtMonoMs = monoNow();
-      feedSocket.send(JSON.stringify({ subscribe: feedChannel }));
+      try {
+        feedSocket.send(JSON.stringify({ subscribe: feedChannel }));
+      } catch (error) {
+        recordSocketEvent("feed", "subscribe_send_error", { detail: diagnosticDetail(error) });
+        session.feed.connectFailed = true;
+        finish();
+        return;
+      }
+      recordSocketEvent("feed", "subscribe_sent", {}, {
+        occurredAtMs: session.feed.subscribedAtMs,
+        occurredMonoMs: session.feed.subscribedAtMonoMs,
+      });
       phase = "warming_feed";
       warmupTimer = setTimer(connectKraken, warmupMs);
     };
@@ -192,6 +257,8 @@ export function collectSession(options, dependencies = {}) {
       const receivedMonoMs = monoNow();
       session.feed.messages += 1;
       if (session.feed.subscribeToFirstMessageMs === null && session.feed.subscribedAtMonoMs !== null) {
+        session.feed.firstMessageAtMs = receivedAtMs;
+        session.feed.firstMessageAtMonoMs = receivedMonoMs;
         session.feed.subscribeToFirstMessageMs = Math.round(receivedMonoMs - session.feed.subscribedAtMonoMs);
       }
       const parsed = parseFeedTrade(event.data, receivedAtMs, receivedMonoMs);
@@ -207,22 +274,26 @@ export function collectSession(options, dependencies = {}) {
       });
       if (parsed.trade) {
         if (session.feed.subscribeToFirstTradeMs === null && session.feed.subscribedAtMonoMs !== null) {
+          session.feed.firstTradeAtMs = receivedAtMs;
+          session.feed.firstTradeAtMonoMs = receivedMonoMs;
           session.feed.subscribeToFirstTradeMs = Math.round(receivedMonoMs - session.feed.subscribedAtMonoMs);
         }
         session.feed.trades.push({ ...parsed.trade, phase, sequence: session.feed.messages });
       }
     };
-    feedSocket.onerror = () => {
+    feedSocket.onerror = (event) => {
       if (finished) return;
       session.feed.errors += 1;
+      recordSocketEvent("feed", "error", { detail: diagnosticDetail(event?.message ?? event?.error) });
       if (isPreMeasurementPhase(phase)) {
         session.feed.connectFailed = true;
         finish();
       }
     };
-    feedSocket.onclose = () => {
+    feedSocket.onclose = (event) => {
       if (finished) return;
       session.feed.closes += 1;
+      recordSocketEvent("feed", "close", closeDetails(event));
       if (isPreMeasurementPhase(phase)) {
         session.feed.connectFailed = true;
         finish();
@@ -240,9 +311,9 @@ export function computeSessionMetrics(session, options) {
       feedCandidates: [],
       sync: computeTradeMetrics([], []),
       drain: computeTradeMetrics([], []),
-      feedMessages: 0,
-      feedParseFailures: 0,
-      krakenParseFailures: 0,
+      deliveryHorizonFeedMessages: 0,
+      deliveryHorizonFeedParseFailures: 0,
+      referenceWindowKrakenParseFailures: 0,
     };
   }
 
@@ -271,10 +342,10 @@ export function computeSessionMetrics(session, options) {
     (trade) => trade.receivedMonoMs < session.measurementStartedMonoMs,
   );
   const drainTrades = context.allTrades.filter((trade) => trade.receivedMonoMs >= referenceEnd);
-  const measurementFeedEvents = session.feed.events.filter(
+  const deliveryHorizonFeedEvents = session.feed.events.filter(
     (event) => event.receivedMonoMs >= session.measurementStartedMonoMs && event.receivedMonoMs <= contextEnd,
   );
-  const measurementKrakenEvents = session.kraken.events.filter(
+  const referenceWindowKrakenEvents = session.kraken.events.filter(
     (event) => event.receivedMonoMs >= session.measurementStartedMonoMs && event.receivedMonoMs < referenceEnd,
   );
   return {
@@ -282,9 +353,15 @@ export function computeSessionMetrics(session, options) {
     feedCandidates,
     sync: summarizeTradeResults(syncTrades),
     drain: summarizeTradeResults(drainTrades),
-    feedMessages: measurementFeedEvents.length,
-    feedParseFailures: measurementFeedEvents.reduce((sum, event) => sum + event.parseFailures, 0),
-    krakenParseFailures: measurementKrakenEvents.reduce((sum, event) => sum + event.parseFailures, 0),
+    deliveryHorizonFeedMessages: deliveryHorizonFeedEvents.length,
+    deliveryHorizonFeedParseFailures: deliveryHorizonFeedEvents.reduce(
+      (sum, event) => sum + event.parseFailures,
+      0,
+    ),
+    referenceWindowKrakenParseFailures: referenceWindowKrakenEvents.reduce(
+      (sum, event) => sum + event.parseFailures,
+      0,
+    ),
   };
 }
 
@@ -299,8 +376,24 @@ export function previewRawMessage(raw) {
   return text.slice(0, 500);
 }
 
+function closeDetails(event) {
+  return {
+    code: Number.isInteger(event?.code) ? event.code : null,
+    reason: diagnosticDetail(event?.reason),
+    wasClean: typeof event?.wasClean === "boolean" ? event.wasClean : null,
+  };
+}
+
+function diagnosticDetail(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const text = value instanceof Error ? value.message : String(value);
+  return text.slice(0, 500);
+}
+
 function emptySession() {
   return {
+    startedAtMs: null,
+    startedMonoMs: null,
     windowMs: 0,
     measurementStartedAtMs: null,
     measurementStartedMonoMs: null,
@@ -319,8 +412,13 @@ function emptySession() {
       messages: 0,
       parseFailures: 0,
       events: [],
+      socketEvents: [],
       subscribedAtMs: null,
       subscribedAtMonoMs: null,
+      firstMessageAtMs: null,
+      firstMessageAtMonoMs: null,
+      firstTradeAtMs: null,
+      firstTradeAtMonoMs: null,
       subscribeToFirstMessageMs: null,
       subscribeToFirstTradeMs: null,
     },
@@ -332,6 +430,11 @@ function emptySession() {
       messages: 0,
       parseFailures: 0,
       events: [],
+      socketEvents: [],
+      subscribedAtMs: null,
+      subscribedAtMonoMs: null,
+      closes: 0,
+      errors: 0,
     },
   };
 }

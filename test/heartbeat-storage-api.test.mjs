@@ -25,6 +25,35 @@ test("SQLite round-trip retains measurement, sync, drain, feed, and raw event co
   assert.equal(restored.drainTrades[0].tradeId, "drain-1");
   assert.equal(restored.feedTrades[0].matchedScope, "measurement");
   assert.equal(restored.messageEvents[1].rawPreview, "{broken");
+  assert.equal(restored.socketEvents[1].eventType, "subscribe_sent");
+  assert.deepEqual(restored.socketEvents.at(-1), {
+    source: "feed",
+    sequence: 3,
+    eventType: "close",
+    phase: "measuring",
+    occurredAtMs: 20_141,
+    occurredMonoMs: 141,
+    code: 1001,
+    reason: "peer restart",
+    wasClean: true,
+    detail: null,
+  });
+  assert.equal(restored.phaseCounts.measuring.feed.messages, 2);
+  assert.equal(restored.phaseCounts.measuring.feed.trades, 1);
+  assert.equal(restored.phaseCounts.measuring.kraken.trades, 2);
+  assert.equal(restored.subscribeToFirstTradeMs, 8);
+  assert.equal(restored.measurementEndedAtMs - restored.measurementStartedAtMs, 90_000);
+  assert.equal(restored.phaseCounts.syncing.kraken.trades, 1);
+  assert.equal(restored.phaseCounts.draining.kraken.trades, 1);
+  const probeColumns = fixture.store.getReadOnlyDb()
+    .prepare("PRAGMA table_info(probes)")
+    .all()
+    .map((column) => column.name);
+  assert.ok(probeColumns.includes("delivery_horizon_feed_messages"));
+  assert.ok(probeColumns.includes("measurement_ended_mono_ms"));
+  assert.ok(probeColumns.includes("delay_p90_ms"));
+  assert.ok(!probeColumns.includes("measurement_feed_messages"));
+  assert.ok(!probeColumns.includes("our_trades"));
   assert.deepEqual(restored.lostTrades.map((trade) => trade.tradeId), ["measurement-2"]);
   const later = sampleProbe({ at: "2026-07-20T10:00:00.000Z", verdict: "ok", note: "" });
   fixture.store.recordProbe(later);
@@ -108,6 +137,11 @@ test("HTTP API performs an authenticated storage round-trip and rejects writes",
   assert.equal(details.body.trades.length, 2);
   assert.equal(details.body.feedTrades.length, 1);
   assert.equal(details.body.messageEvents.length, 2);
+  assert.equal(details.body.socketEvents.length, 4);
+  assert.deepEqual(details.body.phaseCounts.measuring, {
+    feed: { messages: 2, parsedTrades: 1, parseFailures: 1, trades: 1 },
+    kraken: { messages: 0, parsedTrades: 0, parseFailures: 0, trades: 2 },
+  });
 
   const rejectedWrite = await fetch(`${baseUrl}/api/sql`, {
     method: "POST",
@@ -209,39 +243,55 @@ function sampleProbe(overrides = {}) {
   });
   return {
     at: "2026-07-20T09:05:00.000Z",
-    measurementStartedAt: "2026-07-20T09:05:10.000Z",
+    startedAtMs: Date.parse("2026-07-20T09:05:00.000Z"),
+    startedMonoMs: 0,
+    feedSubscribedAtMs: Date.parse("2026-07-20T09:05:00.012Z"),
+    feedSubscribedMonoMs: 12,
+    firstFeedMessageAtMs: Date.parse("2026-07-20T09:05:00.016Z"),
+    firstFeedMessageMonoMs: 16,
+    firstFeedTradeAtMs: Date.parse("2026-07-20T09:05:00.020Z"),
+    firstFeedTradeMonoMs: 20,
+    krakenSubscribedAtMs: Date.parse("2026-07-20T09:05:00.090Z"),
+    krakenSubscribedMonoMs: 90,
+    measurementStartedAtMs: Date.parse("2026-07-20T09:05:00.100Z"),
     measurementStartedMonoMs: 100,
+    measurementEndedAtMs: Date.parse("2026-07-20T09:06:30.100Z"),
+    measurementEndedMonoMs: 90_100,
+    sessionEndedAtMs: Date.parse("2026-07-20T09:06:40.100Z"),
+    sessionEndedMonoMs: 100_100,
     verdict: "degraded",
     note: "missing_trades",
-    windowSeconds: 90,
+    windowMs: 90_000,
     handshakeMs: 12,
-    subscribeToFirstMessageMs: 4,
-    subscribeToFirstTradeMs: 8,
     feedMessages: 3,
     feedParseFailures: 1,
-    measurementFeedMessages: 2,
-    measurementFeedParseFailures: 1,
+    deliveryHorizonFeedMessages: 2,
+    deliveryHorizonFeedParseFailures: 1,
     feedParsedTrades: 1,
-    feedWarmupTrades: 0,
+    feedPreMeasurementTrades: 0,
     feedSyncTrades: 0,
+    feedMeasurementTrades: 1,
+    feedDrainTrades: 0,
     krakenMessages: 4,
     krakenParseFailures: 0,
-    measurementKrakenParseFailures: 0,
+    referenceWindowKrakenParseFailures: 0,
     krakenSyncTrades: 1,
+    krakenDrainTrades: 1,
     syncMatched: 0,
     syncCoveragePct: 0,
-    krakenTrades: 2,
-    ourTrades: 1,
+    feedCandidateTrades: 1,
     referenceTrades: 2,
     matched: 1,
     coveragePct: 50,
     delayMedianMs: 31,
-    delaySlowMs: 31,
+    delayP90Ms: 31,
     delayMaxMs: 31,
     signedDelayMinMs: 31,
     signedDelayMedianMs: 31,
     feedCloses: 0,
     feedErrors: 0,
+    krakenCloses: 0,
+    krakenErrors: 0,
     trades: [
       trade("measurement-1", 100, true, 1),
       trade("measurement-2", 110, false),
@@ -262,6 +312,12 @@ function sampleProbe(overrides = {}) {
     messageEvents: [
       { source: "feed", sequence: 1, phase: "measuring", receivedAtMs: 20_131, receivedMonoMs: 131, parsedTrades: 1, parseFailures: 0 },
       { source: "feed", sequence: 2, phase: "measuring", receivedAtMs: 20_140, receivedMonoMs: 140, parsedTrades: 0, parseFailures: 1, rawPreview: "{broken" },
+    ],
+    socketEvents: [
+      { source: "feed", sequence: 1, eventType: "open", phase: "connecting_feed", occurredAtMs: 20_012, occurredMonoMs: 12 },
+      { source: "feed", sequence: 2, eventType: "subscribe_sent", phase: "connecting_feed", occurredAtMs: 20_012, occurredMonoMs: 12 },
+      { source: "kraken", sequence: 1, eventType: "subscribe_accepted", phase: "connecting_kraken", occurredAtMs: 20_090, occurredMonoMs: 90 },
+      { source: "feed", sequence: 3, eventType: "close", phase: "measuring", occurredAtMs: 20_141, occurredMonoMs: 141, code: 1001, reason: "peer restart", wasClean: true },
     ],
     ...overrides,
   };

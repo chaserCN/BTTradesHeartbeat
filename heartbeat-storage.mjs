@@ -1,6 +1,59 @@
 import { DatabaseSync } from "node:sqlite";
 
-export const SCHEMA_VERSION = 6;
+export const SCHEMA_VERSION = 7;
+
+const PROBE_COLUMNS = [
+  ["at", "at"],
+  ["started_at_ms", "startedAtMs"],
+  ["started_mono_ms", "startedMonoMs"],
+  ["feed_subscribed_at_ms", "feedSubscribedAtMs"],
+  ["feed_subscribed_mono_ms", "feedSubscribedMonoMs"],
+  ["first_feed_message_at_ms", "firstFeedMessageAtMs"],
+  ["first_feed_message_mono_ms", "firstFeedMessageMonoMs"],
+  ["first_feed_trade_at_ms", "firstFeedTradeAtMs"],
+  ["first_feed_trade_mono_ms", "firstFeedTradeMonoMs"],
+  ["kraken_subscribed_at_ms", "krakenSubscribedAtMs"],
+  ["kraken_subscribed_mono_ms", "krakenSubscribedMonoMs"],
+  ["measurement_started_at_ms", "measurementStartedAtMs"],
+  ["measurement_started_mono_ms", "measurementStartedMonoMs"],
+  ["measurement_ended_at_ms", "measurementEndedAtMs"],
+  ["measurement_ended_mono_ms", "measurementEndedMonoMs"],
+  ["session_ended_at_ms", "sessionEndedAtMs"],
+  ["session_ended_mono_ms", "sessionEndedMonoMs"],
+  ["verdict", "verdict"],
+  ["note", "note"],
+  ["window_ms", "windowMs"],
+  ["handshake_ms", "handshakeMs"],
+  ["feed_messages", "feedMessages"],
+  ["feed_parse_failures", "feedParseFailures"],
+  ["delivery_horizon_feed_messages", "deliveryHorizonFeedMessages"],
+  ["delivery_horizon_feed_parse_failures", "deliveryHorizonFeedParseFailures"],
+  ["feed_parsed_trades", "feedParsedTrades"],
+  ["feed_pre_measurement_trades", "feedPreMeasurementTrades"],
+  ["feed_sync_trades", "feedSyncTrades"],
+  ["feed_measurement_trades", "feedMeasurementTrades"],
+  ["feed_drain_trades", "feedDrainTrades"],
+  ["kraken_messages", "krakenMessages"],
+  ["kraken_parse_failures", "krakenParseFailures"],
+  ["reference_window_kraken_parse_failures", "referenceWindowKrakenParseFailures"],
+  ["kraken_sync_trades", "krakenSyncTrades"],
+  ["kraken_drain_trades", "krakenDrainTrades"],
+  ["sync_matched", "syncMatched"],
+  ["sync_coverage_pct", "syncCoveragePct"],
+  ["feed_candidate_trades", "feedCandidateTrades"],
+  ["reference_trades", "referenceTrades"],
+  ["matched", "matched"],
+  ["coverage_pct", "coveragePct"],
+  ["delay_median_ms", "delayMedianMs"],
+  ["delay_p90_ms", "delayP90Ms"],
+  ["delay_max_ms", "delayMaxMs"],
+  ["signed_delay_min_ms", "signedDelayMinMs"],
+  ["signed_delay_median_ms", "signedDelayMedianMs"],
+  ["feed_closes", "feedCloses"],
+  ["feed_errors", "feedErrors"],
+  ["kraken_closes", "krakenCloses"],
+  ["kraken_errors", "krakenErrors"],
+];
 
 export function createHeartbeatStore(dbFile) {
   const db = new DatabaseSync(dbFile);
@@ -8,6 +61,7 @@ export function createHeartbeatStore(dbFile) {
   const schemaVersion = db.prepare("PRAGMA user_version").get().user_version;
   if (schemaVersion !== SCHEMA_VERSION) {
     db.exec(`
+      DROP TABLE IF EXISTS socket_events;
       DROP TABLE IF EXISTS message_events;
       DROP TABLE IF EXISTS feed_trades;
       DROP TABLE IF EXISTS trades;
@@ -21,41 +75,19 @@ export function createHeartbeatStore(dbFile) {
   function recordProbe(probe) {
     db.exec("BEGIN");
     try {
+      const columnNames = PROBE_COLUMNS.map(([column]) => column);
+      const values = PROBE_COLUMNS.map(([, property]) => probe[property] ?? null);
       const info = db.prepare(`
-        INSERT INTO probes (
-          at, measurement_started_at, measurement_started_mono_ms, verdict, note, window_seconds, handshake_ms,
-          subscribe_to_first_message_ms, subscribe_to_first_trade_ms,
-          feed_messages, feed_parse_failures, measurement_feed_messages, measurement_feed_parse_failures,
-          feed_parsed_trades, feed_warmup_trades, feed_sync_trades,
-          kraken_messages, kraken_parse_failures, measurement_kraken_parse_failures,
-          kraken_sync_trades, sync_matched, sync_coverage_pct,
-          kraken_trades, our_trades, reference_trades, matched, coverage_pct,
-          delay_median_ms, delay_slow_ms, delay_max_ms, signed_delay_min_ms, signed_delay_median_ms,
-          feed_closes, feed_errors
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        probe.at, probe.measurementStartedAt ?? null, probe.measurementStartedMonoMs ?? null,
-        probe.verdict, probe.note ?? null,
-        probe.windowSeconds ?? null, probe.handshakeMs ?? null,
-        probe.subscribeToFirstMessageMs ?? null, probe.subscribeToFirstTradeMs ?? null,
-        probe.feedMessages ?? null, probe.feedParseFailures ?? null,
-        probe.measurementFeedMessages ?? null, probe.measurementFeedParseFailures ?? null,
-        probe.feedParsedTrades ?? null, probe.feedWarmupTrades ?? null, probe.feedSyncTrades ?? null,
-        probe.krakenMessages ?? null, probe.krakenParseFailures ?? null,
-        probe.measurementKrakenParseFailures ?? null, probe.krakenSyncTrades ?? null,
-        probe.syncMatched ?? null, probe.syncCoveragePct ?? null,
-        probe.krakenTrades ?? null, probe.ourTrades ?? null, probe.referenceTrades ?? null,
-        probe.matched ?? null, probe.coveragePct ?? null,
-        probe.delayMedianMs ?? null, probe.delaySlowMs ?? null, probe.delayMaxMs ?? null,
-        probe.signedDelayMinMs ?? null, probe.signedDelayMedianMs ?? null,
-        probe.feedCloses ?? null, probe.feedErrors ?? null,
-      );
+        INSERT INTO probes (${columnNames.join(", ")})
+        VALUES (${columnNames.map(() => "?").join(", ")})
+      `).run(...values);
       probe.id = Number(info.lastInsertRowid);
       insertReferenceTrades(probe.id, "measurement", probe.trades || []);
       insertReferenceTrades(probe.id, "sync", probe.syncTrades || []);
       insertReferenceTrades(probe.id, "drain", probe.drainTrades || []);
       insertFeedTrades(probe.id, probe.feedTrades || []);
       insertMessageEvents(probe.id, probe.messageEvents || []);
+      insertSocketEvents(probe.id, probe.socketEvents || []);
       db.exec("COMMIT");
     } catch (error) {
       db.exec("ROLLBACK");
@@ -106,6 +138,23 @@ export function createHeartbeatStore(dbFile) {
       statement.run(
         probeId, event.source, event.sequence, event.phase, event.receivedAtMs, event.receivedMonoMs,
         event.parsedTrades, event.parseFailures, event.rawPreview ?? null,
+      );
+    }
+  }
+
+  function insertSocketEvents(probeId, events) {
+    const statement = db.prepare(`
+      INSERT INTO socket_events (
+        probe_id, source, sequence, event_type, phase, occurred_at_ms, occurred_mono_ms,
+        code, reason, was_clean, detail
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const event of events) {
+      statement.run(
+        probeId, event.source, event.sequence, event.eventType, event.phase,
+        event.occurredAtMs, event.occurredMonoMs, event.code ?? null, event.reason ?? null,
+        event.wasClean === null || event.wasClean === undefined ? null : event.wasClean ? 1 : 0,
+        event.detail ?? null,
       );
     }
   }
@@ -182,16 +231,41 @@ export function createHeartbeatStore(dbFile) {
       }));
   }
 
+  function getSocketEvents(probeId) {
+    return db.prepare(`SELECT source, sequence, event_type, phase, occurred_at_ms, occurred_mono_ms,
+          code, reason, was_clean, detail
+        FROM socket_events WHERE probe_id = ? ORDER BY occurred_mono_ms, id`)
+      .all(probeId)
+      .map((row) => ({
+        source: row.source,
+        sequence: row.sequence,
+        eventType: row.event_type,
+        phase: row.phase,
+        occurredAtMs: row.occurred_at_ms,
+        occurredMonoMs: row.occurred_mono_ms,
+        code: row.code,
+        reason: row.reason,
+        wasClean: row.was_clean === null ? null : row.was_clean === 1,
+        detail: row.detail,
+      }));
+  }
+
   function withTrades(probe) {
     if (!probe) return null;
     const trades = getTrades(probe.id);
+    const syncTrades = getTrades(probe.id, "sync");
+    const drainTrades = getTrades(probe.id, "drain");
+    const feedTrades = getFeedTrades(probe.id);
+    const messageEvents = getMessageEvents(probe.id);
     return {
       ...probe,
       trades,
-      syncTrades: getTrades(probe.id, "sync"),
-      drainTrades: getTrades(probe.id, "drain"),
-      feedTrades: getFeedTrades(probe.id),
-      messageEvents: getMessageEvents(probe.id),
+      syncTrades,
+      drainTrades,
+      feedTrades,
+      messageEvents,
+      socketEvents: getSocketEvents(probe.id),
+      phaseCounts: buildPhaseCounts({ trades, syncTrades, drainTrades, feedTrades, messageEvents }),
       lostTrades: trades.filter((trade) => !trade.delivered),
     };
   }
@@ -224,6 +298,7 @@ export function createHeartbeatStore(dbFile) {
     getProbeById,
     getProbesSince,
     getReadOnlyDb,
+    getSocketEvents,
     getTrades,
     kvGet,
     kvSet,
@@ -237,40 +312,95 @@ export function rowToProbe(row) {
   return {
     id: row.id,
     at: row.at,
-    measurementStartedAt: row.measurement_started_at,
+    startedAtMs: row.started_at_ms,
+    startedMonoMs: row.started_mono_ms,
+    feedSubscribedAtMs: row.feed_subscribed_at_ms,
+    feedSubscribedMonoMs: row.feed_subscribed_mono_ms,
+    firstFeedMessageAtMs: row.first_feed_message_at_ms,
+    firstFeedMessageMonoMs: row.first_feed_message_mono_ms,
+    firstFeedTradeAtMs: row.first_feed_trade_at_ms,
+    firstFeedTradeMonoMs: row.first_feed_trade_mono_ms,
+    krakenSubscribedAtMs: row.kraken_subscribed_at_ms,
+    krakenSubscribedMonoMs: row.kraken_subscribed_mono_ms,
+    measurementStartedAt: toIsoOrNull(row.measurement_started_at_ms),
+    measurementStartedAtMs: row.measurement_started_at_ms,
     measurementStartedMonoMs: row.measurement_started_mono_ms,
+    measurementEndedAt: toIsoOrNull(row.measurement_ended_at_ms),
+    measurementEndedAtMs: row.measurement_ended_at_ms,
+    measurementEndedMonoMs: row.measurement_ended_mono_ms,
+    sessionEndedAt: toIsoOrNull(row.session_ended_at_ms),
+    sessionEndedAtMs: row.session_ended_at_ms,
+    sessionEndedMonoMs: row.session_ended_mono_ms,
     verdict: row.verdict,
     note: row.note ?? "",
-    windowSeconds: row.window_seconds,
+    windowMs: row.window_ms,
+    windowSeconds: row.window_ms === null ? null : Math.round(row.window_ms / 1_000),
     handshakeMs: row.handshake_ms,
-    subscribeToFirstMessageMs: row.subscribe_to_first_message_ms,
-    subscribeToFirstTradeMs: row.subscribe_to_first_trade_ms,
+    subscribeToFirstMessageMs: elapsedOrNull(row.feed_subscribed_mono_ms, row.first_feed_message_mono_ms),
+    subscribeToFirstTradeMs: elapsedOrNull(row.feed_subscribed_mono_ms, row.first_feed_trade_mono_ms),
     feedMessages: row.feed_messages,
     feedParseFailures: row.feed_parse_failures,
-    measurementFeedMessages: row.measurement_feed_messages,
-    measurementFeedParseFailures: row.measurement_feed_parse_failures,
+    deliveryHorizonFeedMessages: row.delivery_horizon_feed_messages,
+    deliveryHorizonFeedParseFailures: row.delivery_horizon_feed_parse_failures,
     feedParsedTrades: row.feed_parsed_trades,
-    feedWarmupTrades: row.feed_warmup_trades,
+    feedPreMeasurementTrades: row.feed_pre_measurement_trades,
     feedSyncTrades: row.feed_sync_trades,
+    feedMeasurementTrades: row.feed_measurement_trades,
+    feedDrainTrades: row.feed_drain_trades,
     krakenMessages: row.kraken_messages,
     krakenParseFailures: row.kraken_parse_failures,
-    measurementKrakenParseFailures: row.measurement_kraken_parse_failures,
+    referenceWindowKrakenParseFailures: row.reference_window_kraken_parse_failures,
     krakenSyncTrades: row.kraken_sync_trades,
+    krakenDrainTrades: row.kraken_drain_trades,
     syncMatched: row.sync_matched,
     syncCoveragePct: row.sync_coverage_pct,
-    krakenTrades: row.kraken_trades,
-    ourTrades: row.our_trades,
+    feedCandidateTrades: row.feed_candidate_trades,
     referenceTrades: row.reference_trades,
     matched: row.matched,
     coveragePct: row.coverage_pct,
     delayMedianMs: row.delay_median_ms,
-    delaySlowMs: row.delay_slow_ms,
+    delayP90Ms: row.delay_p90_ms,
     delayMaxMs: row.delay_max_ms,
     signedDelayMinMs: row.signed_delay_min_ms,
     signedDelayMedianMs: row.signed_delay_median_ms,
     feedCloses: row.feed_closes,
     feedErrors: row.feed_errors,
+    krakenCloses: row.kraken_closes,
+    krakenErrors: row.kraken_errors,
   };
+}
+
+function elapsedOrNull(start, end) {
+  return start === null || start === undefined || end === null || end === undefined
+    ? null
+    : Math.round(end - start);
+}
+
+function toIsoOrNull(value) {
+  return value === null || value === undefined ? null : new Date(value).toISOString();
+}
+
+export function buildPhaseCounts({ trades, syncTrades, drainTrades, feedTrades, messageEvents }) {
+  const phases = ["syncing", "measuring", "draining"];
+  const counts = Object.fromEntries(phases.map((phase) => [phase, {
+    feed: { messages: 0, parsedTrades: 0, parseFailures: 0, trades: 0 },
+    kraken: { messages: 0, parsedTrades: 0, parseFailures: 0, trades: 0 },
+  }]));
+
+  for (const event of messageEvents) {
+    const phase = counts[event.phase];
+    if (!phase || !phase[event.source]) continue;
+    phase[event.source].messages += 1;
+    phase[event.source].parsedTrades += event.parsedTrades;
+    phase[event.source].parseFailures += event.parseFailures;
+  }
+  for (const trade of feedTrades) {
+    if (counts[trade.phase]) counts[trade.phase].feed.trades += 1;
+  }
+  counts.syncing.kraken.trades = syncTrades.length;
+  counts.measuring.kraken.trades = trades.length;
+  counts.draining.kraken.trades = drainTrades.length;
+  return counts;
 }
 
 function schemaSql() {
@@ -278,39 +408,55 @@ function schemaSql() {
     CREATE TABLE IF NOT EXISTS probes (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       at TEXT NOT NULL,
-      measurement_started_at TEXT,
+      started_at_ms INTEGER,
+      started_mono_ms REAL,
+      feed_subscribed_at_ms INTEGER,
+      feed_subscribed_mono_ms REAL,
+      first_feed_message_at_ms INTEGER,
+      first_feed_message_mono_ms REAL,
+      first_feed_trade_at_ms INTEGER,
+      first_feed_trade_mono_ms REAL,
+      kraken_subscribed_at_ms INTEGER,
+      kraken_subscribed_mono_ms REAL,
+      measurement_started_at_ms INTEGER,
       measurement_started_mono_ms REAL,
+      measurement_ended_at_ms INTEGER,
+      measurement_ended_mono_ms REAL,
+      session_ended_at_ms INTEGER,
+      session_ended_mono_ms REAL,
       verdict TEXT NOT NULL,
       note TEXT,
-      window_seconds INTEGER,
+      window_ms REAL,
       handshake_ms INTEGER,
-      subscribe_to_first_message_ms INTEGER,
-      subscribe_to_first_trade_ms INTEGER,
       feed_messages INTEGER,
       feed_parse_failures INTEGER,
-      measurement_feed_messages INTEGER,
-      measurement_feed_parse_failures INTEGER,
+      delivery_horizon_feed_messages INTEGER,
+      delivery_horizon_feed_parse_failures INTEGER,
       feed_parsed_trades INTEGER,
-      feed_warmup_trades INTEGER,
+      feed_pre_measurement_trades INTEGER,
       feed_sync_trades INTEGER,
+      feed_measurement_trades INTEGER,
+      feed_drain_trades INTEGER,
       kraken_messages INTEGER,
       kraken_parse_failures INTEGER,
-      measurement_kraken_parse_failures INTEGER,
+      reference_window_kraken_parse_failures INTEGER,
       kraken_sync_trades INTEGER,
+      kraken_drain_trades INTEGER,
       sync_matched INTEGER,
       sync_coverage_pct INTEGER,
-      kraken_trades INTEGER,
-      our_trades INTEGER,
+      feed_candidate_trades INTEGER,
       reference_trades INTEGER,
       matched INTEGER,
       coverage_pct INTEGER,
       delay_median_ms INTEGER,
-      delay_slow_ms INTEGER,
+      delay_p90_ms INTEGER,
       delay_max_ms INTEGER,
       signed_delay_min_ms INTEGER,
       signed_delay_median_ms INTEGER,
       feed_closes INTEGER,
-      feed_errors INTEGER
+      feed_errors INTEGER,
+      kraken_closes INTEGER,
+      kraken_errors INTEGER
     );
     CREATE INDEX IF NOT EXISTS idx_probes_at ON probes(at);
     CREATE TABLE IF NOT EXISTS trades (
@@ -360,6 +506,22 @@ function schemaSql() {
       UNIQUE(probe_id, source, sequence)
     );
     CREATE INDEX IF NOT EXISTS idx_message_events_probe ON message_events(probe_id, source, phase);
+    CREATE TABLE IF NOT EXISTS socket_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      probe_id INTEGER NOT NULL REFERENCES probes(id),
+      source TEXT NOT NULL,
+      sequence INTEGER NOT NULL,
+      event_type TEXT NOT NULL,
+      phase TEXT NOT NULL,
+      occurred_at_ms INTEGER NOT NULL,
+      occurred_mono_ms REAL NOT NULL,
+      code INTEGER,
+      reason TEXT,
+      was_clean INTEGER,
+      detail TEXT,
+      UNIQUE(probe_id, source, sequence)
+    );
+    CREATE INDEX IF NOT EXISTS idx_socket_events_probe ON socket_events(probe_id, source, phase);
     CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT);
     PRAGMA user_version = ${SCHEMA_VERSION};
   `;

@@ -47,6 +47,12 @@ test("lifecycle records warmup, sync, exact t0, measurement, and exact t1 drain 
   assert.equal(session.endedAtMonoMs, 55);
   assert.equal(session.windowMs, 30);
   assert.equal(session.kraken.disconnected, false);
+  assert.equal(session.feed.subscribedAtMonoMs, 0);
+  assert.equal(session.kraken.subscribedAtMonoMs, 10);
+  assert.deepEqual(session.feed.socketEvents.map((event) => event.eventType), ["open", "subscribe_sent"]);
+  assert.deepEqual(session.kraken.socketEvents.map((event) => event.eventType), [
+    "open", "subscribe_sent", "subscribe_accepted", "close",
+  ]);
 
   const metrics = computeSessionMetrics(session, { preRollMs: 10, drainMs: 5 });
   assert.deepEqual(
@@ -68,10 +74,23 @@ test("feed close during warmup marks connection failure and cancels later phases
   const feed = harness.socket("feed");
   feed.open();
   harness.advanceTo(5);
-  feed.remoteClose();
+  feed.remoteClose({ code: 1006, reason: "upstream reset", wasClean: false });
   const session = await pending;
   assert.equal(session.feed.connectFailed, true);
   assert.equal(session.feed.closes, 1);
+  assert.equal(session.feed.subscribedAtMonoMs, 0);
+  assert.equal(session.feed.firstMessageAtMonoMs, null);
+  assert.deepEqual(session.feed.socketEvents.at(-1), {
+    sequence: 3,
+    eventType: "close",
+    phase: "warming_feed",
+    occurredAtMs: baseTimeMs + 5,
+    occurredMonoMs: 5,
+    code: 1006,
+    reason: "upstream reset",
+    wasClean: false,
+    detail: null,
+  });
   assert.equal(session.measurementStartedMonoMs, null);
   harness.advanceTo(100);
   assert.equal(harness.sockets.length, 1, "Kraken must not connect after early finish");
@@ -102,8 +121,8 @@ test("feed error and close during measurement are recorded without erasing the f
   kraken.open();
   kraken.message(subscriptionAccepted());
   harness.advanceTo(20);
-  feed.error();
-  feed.remoteClose();
+  feed.error({ message: "temporary network failure" });
+  feed.remoteClose({ code: 1001, reason: "peer restart", wasClean: true });
   assert.equal(feed.closed, false, "remote close is distinct from collector cleanup in the fake");
   harness.advanceTo(55);
   const session = await pending;
@@ -112,6 +131,27 @@ test("feed error and close during measurement are recorded without erasing the f
   assert.equal(session.feed.connectFailed, false);
   assert.equal(session.measurementStartedMonoMs, 20);
   assert.equal(session.referenceEndedMonoMs, 50);
+  assert.deepEqual(
+    session.feed.socketEvents.slice(-2).map((event) => [event.eventType, event.code, event.reason, event.detail]),
+    [["error", null, null, "temporary network failure"], ["close", 1001, "peer restart", null]],
+  );
+});
+
+// Intent: an NTP wall-clock correction during connect must not alter duration
+// metrics, while persisted wall and monotonic timestamps retain both views.
+test("feed handshake uses monotonic time across a wall-clock jump", async () => {
+  const harness = createHarness();
+  const pending = collectSession(sessionOptions(), harness.dependencies);
+  harness.advanceTo(7);
+  harness.jumpWallBy(3_600_000);
+  const feed = harness.socket("feed");
+  feed.open();
+  harness.advanceTo(8);
+  feed.remoteClose();
+  const session = await pending;
+  assert.equal(session.feed.handshakeMs, 7);
+  assert.equal(session.feed.subscribedAtMonoMs, 7);
+  assert.equal(session.feed.subscribedAtMs, baseTimeMs + 3_600_007);
 });
 
 test("Kraken error before subscription acknowledgement is a reference connection failure", async () => {
@@ -216,6 +256,22 @@ test("subscription rejection and constructor failures terminate in the owning st
   krakenThrowHarness.advanceTo(10);
   const krakenFailure = await krakenPending;
   assert.equal(krakenFailure.kraken.connectFailed, true);
+
+  const feedSendHarness = createHarness({ throwSendUrl: "ws://feed" });
+  const feedSendPending = collectSession(sessionOptions(), feedSendHarness.dependencies);
+  feedSendHarness.socket("feed").open();
+  const feedSendFailure = await feedSendPending;
+  assert.equal(feedSendFailure.feed.connectFailed, true);
+  assert.equal(feedSendFailure.feed.socketEvents.at(-1).eventType, "subscribe_send_error");
+
+  const krakenSendHarness = createHarness({ throwSendUrl: "ws://kraken" });
+  const krakenSendPending = collectSession(sessionOptions(), krakenSendHarness.dependencies);
+  krakenSendHarness.socket("feed").open();
+  krakenSendHarness.advanceTo(10);
+  krakenSendHarness.socket("kraken").open();
+  const krakenSendFailure = await krakenSendPending;
+  assert.equal(krakenSendFailure.kraken.connectFailed, true);
+  assert.equal(krakenSendFailure.kraken.socketEvents.at(-1).eventType, "subscribe_send_error");
 });
 
 // Intent: only feed failures in the delivery horizon and Kraken failures in
@@ -261,15 +317,15 @@ test("parse-failure authority respects sync, measurement, and drain boundaries",
       sync: [metrics.sync.referenceTrades, metrics.sync.matched],
       measurement: [metrics.referenceTrades, metrics.matched],
       drain: [metrics.drain.referenceTrades, metrics.drain.matched],
-      feedParseFailures: metrics.feedParseFailures,
-      krakenParseFailures: metrics.krakenParseFailures,
+      deliveryHorizonFeedParseFailures: metrics.deliveryHorizonFeedParseFailures,
+      referenceWindowKrakenParseFailures: metrics.referenceWindowKrakenParseFailures,
     },
     {
       sync: [1, 1],
       measurement: [1, 1],
       drain: [1, 1],
-      feedParseFailures: 7,
-      krakenParseFailures: 3,
+      deliveryHorizonFeedParseFailures: 7,
+      referenceWindowKrakenParseFailures: 3,
     },
   );
 });
@@ -285,11 +341,18 @@ test("failed pre-measurement sessions produce empty neutral metrics", () => {
       references: metrics.referenceTrades,
       matched: metrics.matched,
       coverage: metrics.coveragePct,
-      feedMessages: metrics.feedMessages,
-      feedParseFailures: metrics.feedParseFailures,
-      krakenParseFailures: metrics.krakenParseFailures,
+      deliveryHorizonFeedMessages: metrics.deliveryHorizonFeedMessages,
+      deliveryHorizonFeedParseFailures: metrics.deliveryHorizonFeedParseFailures,
+      referenceWindowKrakenParseFailures: metrics.referenceWindowKrakenParseFailures,
     },
-    { references: 0, matched: 0, coverage: null, feedMessages: 0, feedParseFailures: 0, krakenParseFailures: 0 },
+    {
+      references: 0,
+      matched: 0,
+      coverage: null,
+      deliveryHorizonFeedMessages: 0,
+      deliveryHorizonFeedParseFailures: 0,
+      referenceWindowKrakenParseFailures: 0,
+    },
   );
 });
 
@@ -316,6 +379,7 @@ function sessionOptions() {
 function createHarness(options = {}) {
   const scheduler = new ManualScheduler();
   const sockets = [];
+  let wallOffsetMs = 0;
   class FakeWebSocket {
     constructor(url) {
       if (url === options.throwUrl) throw new Error("constructor failure");
@@ -325,24 +389,28 @@ function createHarness(options = {}) {
       sockets.push(this);
     }
 
-    send(payload) { this.sent.push(payload); }
+    send(payload) {
+      if (this.url === options.throwSendUrl) throw new Error("send failure");
+      this.sent.push(payload);
+    }
     close() { this.closed = true; }
     open() { this.onopen?.(); }
     message(data) { this.onmessage?.({ data }); }
-    error() { this.onerror?.(); }
-    remoteClose() { this.onclose?.(); }
+    error(event = {}) { this.onerror?.(event); }
+    remoteClose(event = {}) { this.onclose?.(event); }
   }
   return {
     sockets,
     dependencies: {
       WebSocketClass: FakeWebSocket,
-      wallNow: () => baseTimeMs + scheduler.now,
+      wallNow: () => baseTimeMs + scheduler.now + wallOffsetMs,
       monoNow: () => scheduler.now,
       setTimer: (callback, delay) => scheduler.setTimer(callback, delay),
       clearTimer: (id) => scheduler.clearTimer(id),
       logError: () => {},
     },
     advanceTo: (time) => scheduler.advanceTo(time),
+    jumpWallBy(deltaMs) { wallOffsetMs += deltaMs; },
     socket(name) {
       const index = name === "feed" ? 0 : 1;
       assert.ok(sockets[index], `${name} socket has not been created`);

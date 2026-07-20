@@ -143,7 +143,7 @@ export function summarizeTradeResults(allTrades) {
     matched: delays.length,
     coveragePct: allTrades.length ? Math.round((delays.length / allTrades.length) * 100) : null,
     delayMedianMs: percentileAt(delays, 0.5),
-    delaySlowMs: percentileAt(delays, 0.9),
+    delayP90Ms: percentileAt(delays, 0.9),
     delayMaxMs: delays.length ? delays[delays.length - 1] : null,
     signedDelayMinMs: signedDelays.length ? signedDelays[0] : null,
     signedDelayMedianMs: percentileAt(signedDelays, 0.5),
@@ -207,27 +207,27 @@ export function judgeProbe(session, metrics, slowDelayMs = 5_000) {
   if (session.feed.connectFailed) return { verdict: "down", note: "connect_failed" };
   if (session.kraken.disconnected) return { verdict: "inconclusive", note: "kraken_disconnected" };
   if (session.kraken.connectFailed) return { verdict: "inconclusive", note: "kraken_unavailable" };
-  if (metrics.krakenParseFailures > 0) {
+  if (metrics.referenceWindowKrakenParseFailures > 0) {
     return { verdict: "inconclusive", note: "kraken_parse_failure" };
   }
   if (metrics.referenceTrades === 0) return { verdict: "inconclusive", note: "quiet_market" };
   if (metrics.feedCandidates.length === 0) {
     return {
       verdict: "down",
-      note: metrics.feedMessages > 0 ? "invalid_feed_messages" : "feed_silent",
+      note: metrics.deliveryHorizonFeedMessages > 0 ? "invalid_feed_messages" : "feed_silent",
     };
   }
   if (metrics.matched === 0) return { verdict: "down", note: "no_matches" };
   if (session.feed.closes > 0 || session.feed.errors > 0) {
     return { verdict: "degraded", note: "socket_dropped" };
   }
-  if (metrics.feedParseFailures > 0) {
+  if (metrics.deliveryHorizonFeedParseFailures > 0) {
     return { verdict: "degraded", note: "invalid_feed_messages" };
   }
   if (metrics.matched < metrics.referenceTrades) {
     return { verdict: "degraded", note: "missing_trades" };
   }
-  if (metrics.delaySlowMs !== null && metrics.delaySlowMs > slowDelayMs) {
+  if (metrics.delayP90Ms !== null && metrics.delayP90Ms > slowDelayMs) {
     return { verdict: "degraded", note: "slow_delivery" };
   }
   return { verdict: "ok", note: "" };
