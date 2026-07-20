@@ -38,7 +38,7 @@ Probes run around the clock and every result is recorded — quiet hours (23:00�
 Restricted to `TELEGRAM_CHAT_ID` (this bot lives in its own group, separate from the app_store bot):
 
 - `/stats` — current state of the feed, last probe, whether quiet hours are active, uptime.
-- `/day` — the last 24 hours as a list: one compact result per persistent probe number (`№47, 19:42: 78/100, покриття 78% 🟠 — губилися угоди`), plus totals and typical/worst delay.
+- `/day` — the last 24 hours as a list: one compact result per persistent probe number (`№47, 19:42: дійшло 78/100 (78%) 🟠 — губилися угоди`), plus totals and typical/worst delay.
 - `/check` — run a probe right now and reply with the result (normally under two minutes including setup and delivery drain). While any probe is running, repeated `/check` commands are not processed: the first duplicate gets a short "already running" notice, the rest are dropped, and the scheduled hourly probe also never overlaps a manual one.
 - `/details` — user-focused breakdown of the last probe: counts, delays, actual parse/socket problems, and every reference trade with exchange-side time, price, quantity, side, and delivery status. Internal activation, handshake and overlapping-sync telemetry stays in the API instead of adding Telegram noise. Loss runs are described from the full ordered stream, so a delivered trade breaks a run and Kraken packet batching cannot invent one. `/details 47` (also `№47`) shows the same for a recorded probe number.
 

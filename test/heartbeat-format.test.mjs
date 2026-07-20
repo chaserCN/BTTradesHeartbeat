@@ -15,7 +15,7 @@ test("day lines show delivery coverage or an explicit missing-reference state", 
       referenceTrades: 150,
       coveragePct: 100,
     }, { timeZone: "Europe/Kyiv" }),
-    "№1, 17:42: 150/150, покриття 100% 🟢",
+    "№1, 17:42: дійшло 150/150 (100%) 🟢",
   );
   assert.equal(
     formatDayProbeLine({
@@ -26,7 +26,7 @@ test("day lines show delivery coverage or an explicit missing-reference state", 
       referenceTrades: 100,
       coveragePct: 78,
     }, { timeZone: "Europe/Kyiv", problemSummary: "губилися угоди" }),
-    "№2, 17:42: 78/100, покриття 78% 🟠 — губилися угоди",
+    "№2, 17:42: дійшло 78/100 (78%) 🟠 — губилися угоди",
   );
   assert.equal(
     formatDayProbeLine({

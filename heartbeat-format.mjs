@@ -11,7 +11,7 @@ export function formatDayProbeLine(probe, options = {}) {
   const prefix = `№${probe.id}, ${formatTimeShort(probe.at, timeZone)}:`;
   const hasReference = Number.isFinite(probe.referenceTrades) && probe.referenceTrades > 0;
   const result = hasReference
-    ? `${probe.matched ?? 0}/${probe.referenceTrades}, покриття ${probe.coveragePct ?? "—"}%`
+    ? `дійшло ${probe.matched ?? 0}/${probe.referenceTrades} (${probe.coveragePct ?? "—"}%)`
     : "немає еталонних угод";
   const suffix = problemSummary ? ` — ${problemSummary}` : "";
   return `${prefix} ${result} ${verdictEmoji(probe.verdict)}${suffix}`;
