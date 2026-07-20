@@ -169,6 +169,7 @@ export function sendJson(response, status, payload) {
 }
 
 function clampInt(value, fallback, min, max) {
+  if (value === null || value === undefined || String(value).trim() === "") return fallback;
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return fallback;
   return Math.min(max, Math.max(min, Math.trunc(parsed)));

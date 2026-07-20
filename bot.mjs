@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 
 import { judgeProbe } from "./heartbeat-core.mjs";
 import { createApiHandler, sendJson } from "./heartbeat-api.mjs";
+import { isKrakenReferenceFailure, runScheduledProbeSequence } from "./heartbeat-cycle.mjs";
 import { formatDetailsMessages } from "./heartbeat-format.mjs";
 import { collectSession, computeSessionMetrics } from "./heartbeat-session.mjs";
 import { createHeartbeatStore } from "./heartbeat-storage.mjs";
@@ -121,27 +122,14 @@ async function heartbeatCycle() {
   lastScheduledCycleAtMs = Date.now();
 
   try {
-    let probe = await runProbe();
-    recordProbe(probe);
-
-    // A broken reference stream cannot be used to judge our feed. Retry once
-    // soon instead of waiting for the next hourly cycle.
-    if (isKrakenReferenceFailure(probe)) {
-      console.log(`Kraken reference failed (${probe.note}). Retrying in ${Math.round(config.confirmDelayMs / 1000)}s.`);
-      await sleep(config.confirmDelayMs);
-      probe = await runProbe();
-      recordProbe(probe);
-    }
-
-    // A single bad probe can be a network hiccup on our side. Re-check once
-    // after a pause before alarming the chat.
-    const lastNotified = kvGet("lastNotifiedVerdict") || "ok";
-    if ((probe.verdict === "down" || probe.verdict === "degraded") && probe.verdict !== lastNotified) {
-      console.log(`Verdict "${probe.verdict}" differs from last notified "${lastNotified}". Confirming in ${Math.round(config.confirmDelayMs / 1000)}s.`);
-      await sleep(config.confirmDelayMs);
-      probe = await runProbe();
-      recordProbe(probe);
-    }
+    const probe = await runScheduledProbeSequence({
+      runProbe,
+      recordProbe,
+      wait: sleep,
+      confirmDelayMs: config.confirmDelayMs,
+      getLastNotifiedVerdict: () => kvGet("lastNotifiedVerdict") || "ok",
+      log: console.log,
+    });
 
     await maybeNotifyVerdict(probe);
     if (activeProbe.resultChatId) {
@@ -406,12 +394,6 @@ function formatManualCheckMessage(probe) {
   }
 
   return lines.join("\n");
-}
-
-function isKrakenReferenceFailure(probe) {
-  return probe.note === "kraken_unavailable" ||
-    probe.note === "kraken_disconnected" ||
-    probe.note === "kraken_parse_failure";
 }
 
 function describeInconclusiveDetail(probe) {

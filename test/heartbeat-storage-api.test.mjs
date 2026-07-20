@@ -26,6 +26,12 @@ test("SQLite round-trip retains measurement, sync, drain, feed, and raw event co
   assert.equal(restored.feedTrades[0].matchedScope, "measurement");
   assert.equal(restored.messageEvents[1].rawPreview, "{broken");
   assert.deepEqual(restored.lostTrades.map((trade) => trade.tradeId), ["measurement-2"]);
+  const later = sampleProbe({ at: "2026-07-20T10:00:00.000Z", verdict: "ok", note: "" });
+  fixture.store.recordProbe(later);
+  assert.deepEqual(
+    fixture.store.getProbesSince(Date.parse("2026-07-20T09:30:00.000Z")).map((entry) => entry.id),
+    [later.id],
+  );
 });
 
 // Intent: a duplicate child row must roll back the parent and every earlier
@@ -125,6 +131,54 @@ test("HTTP API performs an authenticated storage round-trip and rejects writes",
   }).then(readResponse);
   assert.equal(sql.status, 200);
   assert.equal(sql.body.rows[0].count, 2);
+
+  const writeThroughCte = await fetch(`${baseUrl}/api/sql`, {
+    method: "POST",
+    headers,
+    body: "WITH doomed AS (SELECT 1) DELETE FROM probes",
+  }).then(readResponse);
+  assert.equal(writeThroughCte.status, 400);
+  assert.equal(fixture.store.getLastProbe().id, second.id);
+
+  const statementBatch = await fetch(`${baseUrl}/api/sql`, {
+    method: "POST",
+    headers,
+    body: "SELECT 1; SELECT 2",
+  }).then(readResponse);
+  assert.equal(statementBatch.status, 400);
+
+  const hugeSelect = await fetch(`${baseUrl}/api/sql`, {
+    method: "POST",
+    headers,
+    body: "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 5001) SELECT x FROM n",
+  }).then(readResponse);
+  assert.equal(hugeSelect.status, 200);
+  assert.equal(hugeSelect.body.rowCount, 5_001);
+  assert.equal(hugeSelect.body.truncated, true);
+  assert.equal(hugeSelect.body.rows.length, 5_000);
+
+  const injectedVerdict = encodeURIComponent("ok') OR 1=1 --");
+  const filtered = await fetch(`${baseUrl}/api/probes?verdict=${injectedVerdict}`, { headers }).then(readResponse);
+  assert.equal(filtered.status, 200);
+  assert.equal(filtered.body.count, 0);
+  const clamped = await fetch(`${baseUrl}/api/probes?limit=-50`, { headers }).then(readResponse);
+  assert.equal(clamped.body.count, 1);
+
+  const directHourRows = fixture.store.getReadOnlyDb()
+    .prepare("SELECT id, at FROM probes WHERE at >= ? ORDER BY id DESC")
+    .all(new Date(nowMs - 3_600_000).toISOString());
+  assert.equal(directHourRows.length, 2, JSON.stringify(directHourRows));
+  const byHours = await fetch(`${baseUrl}/api/probes?hours=0`, { headers }).then(readResponse);
+  assert.equal(byHours.body.count, 2, JSON.stringify(byHours.body));
+  const bySince = await fetch(`${baseUrl}/api/probes?since=${encodeURIComponent("2026-07-20T09:58:00Z")}`, { headers }).then(readResponse);
+  assert.deepEqual(bySince.body.probes.map((entry) => entry.id), [second.id]);
+
+  const missingProbe = await fetch(`${baseUrl}/api/probes/999999`, { headers }).then(readResponse);
+  assert.equal(missingProbe.status, 404);
+  const unknownRoute = await fetch(`${baseUrl}/api/unknown`, { headers }).then(readResponse);
+  assert.equal(unknownRoute.status, 404);
+  const missingSql = await fetch(`${baseUrl}/api/sql`, { headers }).then(readResponse);
+  assert.equal(missingSql.status, 400);
 });
 
 function createStoreFixture(t) {

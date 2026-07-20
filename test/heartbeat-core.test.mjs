@@ -83,6 +83,59 @@ test("malformed feed messages are counted instead of disappearing", () => {
   );
 });
 
+// Intent: JSON coercion must not turn absent, empty, boolean, zero, or negative
+// wire values into plausible trades that evade parse-failure telemetry.
+test("parsers reject non-positive and coercible fake numeric fields", () => {
+  const invalidValues = [null, "", "   ", "0x10", false, true, 0, -1];
+  for (const value of invalidValues) {
+    const feedPrice = parseFeedTrade(JSON.stringify({
+      time: 1_784_538_322,
+      price: value,
+      quantity: 0.0001,
+      type: "buy",
+    }), 1, 1);
+    const feedQuantity = parseFeedTrade(JSON.stringify({
+      time: 1_784_538_322,
+      price: 60_000,
+      quantity: value,
+      type: "buy",
+    }), 1, 1);
+    assert.equal(feedPrice.parseFailures, 1, `feed price ${JSON.stringify(value)}`);
+    assert.equal(feedQuantity.parseFailures, 1, `feed quantity ${JSON.stringify(value)}`);
+
+    const kraken = parseKrakenMessage(JSON.stringify({
+      channel: "trade",
+      type: "update",
+      data: [{
+        timestamp: "2026-07-20T09:05:22Z",
+        price: value,
+        qty: 0.0001,
+        side: "buy",
+      }],
+    }), 1, 1);
+    assert.equal(kraken.parseFailures, 1, `Kraken price ${JSON.stringify(value)}`);
+    assert.equal(kraken.trades.length, 0);
+
+    const krakenQuantity = parseKrakenMessage(JSON.stringify({
+      channel: "trade",
+      type: "update",
+      data: [{
+        timestamp: "2026-07-20T09:05:22Z",
+        price: 60_000,
+        qty: value,
+        side: "buy",
+      }],
+    }), 1, 1);
+    assert.equal(krakenQuantity.parseFailures, 1, `Kraken quantity ${JSON.stringify(value)}`);
+  }
+  assert.equal(parseFeedTrade(JSON.stringify({
+    time: -1,
+    price: 60_000,
+    quantity: 0.0001,
+    type: "buy",
+  }), 1, 1).parseFailures, 1);
+});
+
 test("a mixed Kraken packet retains valid trades and counts each invalid item", () => {
   const parsed = parseKrakenMessage(JSON.stringify({
     channel: "trade",
@@ -102,6 +155,21 @@ test("a mixed Kraken packet retains valid trades and counts each invalid item", 
   assert.equal(parsed.trades.length, 1);
   assert.equal(parsed.trades[0].tradeId, "1");
   assert.equal(parsed.parseFailures, 2);
+});
+
+test("malformed Kraken JSON is counted while non-trade control messages are ignored", () => {
+  assert.deepEqual(parseKrakenMessage("{broken", 1, 1), {
+    subscription: null,
+    error: null,
+    trades: [],
+    parseFailures: 1,
+  });
+  assert.deepEqual(parseKrakenMessage(JSON.stringify({ channel: "heartbeat" }), 1, 1), {
+    subscription: null,
+    error: null,
+    trades: [],
+    parseFailures: 0,
+  });
 });
 
 test("the real value grain stays outside the former numeric tolerance", () => {
@@ -241,6 +309,56 @@ test("global matcher agrees with brute force on randomized small classes", () =>
   }
 });
 
+// Intent: across mixed keys and both temporal bounds, production must equal an
+// independent exhaustive maximum-cardinality/minimum-cost oracle.
+test("mixed-key matcher agrees with exhaustive oracle under randomized fractional timing", () => {
+  let state = 0xc0ffee42;
+  const random = (limit) => {
+    state = (state * 1_664_525 + 1_013_904_223) >>> 0;
+    return state % limit;
+  };
+  const makeValue = (kind, index) => ({
+    exchangeAtMs: baseExchangeAtMs + random(25) - 12 + (random(2) ? 0.5 : 0),
+    receivedAtMs: 10_000 + index,
+    receivedMonoMs: random(25) - 12 + (random(2) ? 0.5 : 0),
+    price: 63_977.5 + random(3) * 0.1,
+    quantity: 0.00000001 * (1 + random(3)),
+    side: random(2) ? "buy" : "sell",
+    ...(kind === "reference" ? { tradeId: String(index) } : { sequence: index + 1 }),
+  });
+  const limits = { maxLeadMs: 5, maxLagMs: 7, maxExchangeSkewMs: 6 };
+
+  for (let iteration = 0; iteration < 300; iteration += 1) {
+    const references = Array.from({ length: 1 + random(6) }, (_, index) => makeValue("reference", index));
+    const feeds = Array.from({ length: 1 + random(6) }, (_, index) => makeValue("feed", index));
+    const expected = bruteForceBoundedMatching(references, feeds, limits);
+    const metrics = computeTradeMetrics(references, feeds, limits);
+    const actualCost = metrics.allTrades.reduce((sum, result, referenceIndex) => {
+      if (!result.delivered) return sum;
+      const matchedFeed = feeds.find((feed) => feed.sequence === result.matchedFeedSequence);
+      return sum + Math.round(Math.abs(matchedFeed.receivedMonoMs - references[referenceIndex].receivedMonoMs));
+    }, 0);
+    assert.deepEqual(
+      { matched: metrics.matched, cost: actualCost, uniqueFeeds: metrics.matchedFeedIndices.size },
+      { ...expected, uniqueFeeds: expected.matched },
+      `seed iteration ${iteration}`,
+    );
+
+    const reversed = computeTradeMetrics([...references].reverse(), [...feeds].reverse(), limits);
+    const reversedCost = reversed.allTrades.reduce((sum, result, reversedReferenceIndex) => {
+      if (!result.delivered) return sum;
+      const matchedFeed = feeds.find((feed) => feed.sequence === result.matchedFeedSequence);
+      const reference = references[references.length - 1 - reversedReferenceIndex];
+      return sum + Math.round(Math.abs(matchedFeed.receivedMonoMs - reference.receivedMonoMs));
+    }, 0);
+    assert.deepEqual(
+      { matched: reversed.matched, cost: reversedCost },
+      expected,
+      `permutation iteration ${iteration}`,
+    );
+  }
+});
+
 // Intent: a burst of equal-value trades must conserve one-to-one cardinality
 // and choose the globally nearest copies instead of collapsing duplicates.
 test("matcher handles two hundred identical trades without reuse or loss", () => {
@@ -320,6 +438,48 @@ test("a malformed Kraken measurement makes the verdict inconclusive", () => {
   assert.deepEqual(verdict, { verdict: "inconclusive", note: "kraken_parse_failure" });
 });
 
+// Intent: when several faults coexist, verdict authority and threshold
+// boundaries must remain stable instead of changing with incidental fields.
+test("verdict precedence and the slow threshold are exhaustive", () => {
+  const healthySession = {
+    feed: { connectFailed: false, closes: 0, errors: 0 },
+    kraken: { connectFailed: false, disconnected: false },
+  };
+  const healthyMetrics = {
+    referenceTrades: 2,
+    feedCandidates: [feedTrade()],
+    matched: 2,
+    feedMessages: 1,
+    feedParseFailures: 0,
+    krakenParseFailures: 0,
+    delaySlowMs: 5_000,
+  };
+  const cases = [
+    [
+      { ...healthySession, feed: { ...healthySession.feed, connectFailed: true }, kraken: { connectFailed: true, disconnected: true } },
+      { ...healthyMetrics, krakenParseFailures: 1 },
+      ["down", "connect_failed"],
+    ],
+    [{ ...healthySession, kraken: { ...healthySession.kraken, disconnected: true } }, healthyMetrics, ["inconclusive", "kraken_disconnected"]],
+    [{ ...healthySession, kraken: { ...healthySession.kraken, connectFailed: true } }, healthyMetrics, ["inconclusive", "kraken_unavailable"]],
+    [healthySession, { ...healthyMetrics, krakenParseFailures: 1 }, ["inconclusive", "kraken_parse_failure"]],
+    [healthySession, { ...healthyMetrics, referenceTrades: 0 }, ["inconclusive", "quiet_market"]],
+    [healthySession, { ...healthyMetrics, feedCandidates: [], matched: 0, feedMessages: 0 }, ["down", "feed_silent"]],
+    [healthySession, { ...healthyMetrics, feedCandidates: [], matched: 0, feedMessages: 1 }, ["down", "invalid_feed_messages"]],
+    [healthySession, { ...healthyMetrics, matched: 0 }, ["down", "no_matches"]],
+    [{ ...healthySession, feed: { ...healthySession.feed, closes: 1 } }, { ...healthyMetrics, feedParseFailures: 1, matched: 1 }, ["degraded", "socket_dropped"]],
+    [{ ...healthySession, feed: { ...healthySession.feed, errors: 1 } }, healthyMetrics, ["degraded", "socket_dropped"]],
+    [healthySession, { ...healthyMetrics, feedParseFailures: 1, matched: 1 }, ["degraded", "invalid_feed_messages"]],
+    [healthySession, { ...healthyMetrics, matched: 1, delaySlowMs: 9_000 }, ["degraded", "missing_trades"]],
+    [healthySession, { ...healthyMetrics, delaySlowMs: 5_001 }, ["degraded", "slow_delivery"]],
+    [healthySession, healthyMetrics, ["ok", ""]],
+  ];
+  for (const [session, metrics, expected] of cases) {
+    const verdict = judgeProbe(session, metrics, 5_000);
+    assert.deepEqual([verdict.verdict, verdict.note], expected);
+  }
+});
+
 function bruteForceMatching(references, feeds, maxLeadMs, maxLagMs) {
   let best = { matched: -1, cost: Infinity };
   const visit = (referenceIndex, usedFeed, matched, cost) => {
@@ -336,6 +496,33 @@ function bruteForceMatching(references, feeds, maxLeadMs, maxLagMs) {
       if (delay < -maxLeadMs || delay > maxLagMs) continue;
       usedFeed.add(feedIndex);
       visit(referenceIndex + 1, usedFeed, matched + 1, cost + Math.abs(Math.round(delay)));
+      usedFeed.delete(feedIndex);
+    }
+  };
+  visit(0, new Set(), 0, 0);
+  return best;
+}
+
+function bruteForceBoundedMatching(references, feeds, limits) {
+  let best = { matched: -1, cost: Infinity };
+  const visit = (referenceIndex, usedFeed, matched, cost) => {
+    if (referenceIndex === references.length) {
+      if (matched > best.matched || (matched === best.matched && cost < best.cost)) {
+        best = { matched, cost };
+      }
+      return;
+    }
+    visit(referenceIndex + 1, usedFeed, matched, cost);
+    for (let feedIndex = 0; feedIndex < feeds.length; feedIndex += 1) {
+      if (usedFeed.has(feedIndex)) continue;
+      const reference = references[referenceIndex];
+      const feed = feeds[feedIndex];
+      if (tradeMatchKey(reference) !== tradeMatchKey(feed)) continue;
+      const delay = feed.receivedMonoMs - reference.receivedMonoMs;
+      if (delay < -limits.maxLeadMs || delay > limits.maxLagMs) continue;
+      if (Math.abs(feed.exchangeAtMs - reference.exchangeAtMs) > limits.maxExchangeSkewMs) continue;
+      usedFeed.add(feedIndex);
+      visit(referenceIndex + 1, usedFeed, matched + 1, cost + Math.round(Math.abs(delay)));
       usedFeed.delete(feedIndex);
     }
   };

@@ -55,6 +55,49 @@ test("row chunking does not drop a row at an exact boundary", async () => {
   assert.deepEqual(chunkRowsByLength(["1234", "5678", "9"], 10), [["1234", "5678"], ["9"]]);
 });
 
+test("every verdict detail variant is bounded and contains no missing placeholders", () => {
+  const variants = [
+    ["ok", ""],
+    ["degraded", "missing_trades"],
+    ["degraded", "invalid_feed_messages"],
+    ["degraded", "socket_dropped"],
+    ["down", "connect_failed"],
+    ["down", "feed_silent"],
+    ["down", "no_matches"],
+    ["inconclusive", "quiet_market"],
+    ["inconclusive", "kraken_unavailable"],
+    ["inconclusive", "kraken_disconnected"],
+    ["inconclusive", "kraken_parse_failure"],
+  ];
+  for (const [verdict, note] of variants) {
+    const messages = formatDetailsMessages({
+      id: 7,
+      at: "2026-07-20T09:05:00Z",
+      verdict,
+      note,
+      windowSeconds: 90,
+      referenceTrades: 2,
+      krakenTrades: 2,
+      matched: verdict === "ok" ? 2 : 1,
+      coveragePct: verdict === "ok" ? 100 : 50,
+      delayMedianMs: 31,
+      delayMaxMs: 59,
+      handshakeMs: 10,
+      subscribeToFirstTradeMs: 14,
+      krakenSyncTrades: 1,
+      syncMatched: 1,
+      syncCoveragePct: 100,
+      measurementFeedParseFailures: note === "invalid_feed_messages" ? 1 : 0,
+      measurementKrakenParseFailures: note === "kraken_parse_failure" ? 1 : 0,
+      feedCloses: note === "socket_dropped" ? 1 : 0,
+      feedErrors: 0,
+      lostTrades: [],
+    }, { timeZone: "UTC" });
+    assert.ok(messages.every((message) => message.length <= TELEGRAM_MESSAGE_LIMIT));
+    assert.doesNotMatch(messages.join("\n"), /undefined|NaN/);
+  }
+});
+
 function countOccurrences(text, needle) {
   return text.split(needle).length - 1;
 }

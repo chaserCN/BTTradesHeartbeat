@@ -19,6 +19,10 @@ A first `down`/`degraded` probe is re-checked once after `CONFIRM_DELAY_SECONDS`
 
 If the Kraken reference is unavailable or disconnects, the bot records the reason and retries once after `CONFIRM_DELAY_SECONDS`. If the retry also fails, it warns the chat outside quiet hours that BitcoinTicker could not be checked; it never labels the app feed `down` from an incomplete reference.
 
+The same one-retry rule applies if Kraken fails during the confirmation of a
+new `down`/`degraded` result. Retries are bounded: each primary or confirmation
+probe gets at most one Kraken retry, so a cycle cannot loop forever.
+
 Outside quiet hours, every `down`/`degraded` result sends a notification. An `ok` result sends a notification only when the last notified state was a problem (broke → recovered). Every Kraken trade must have a one-to-one app-feed match by exact price + quantity + side, bounded in both exchange time and monotonic receive time. Feed `time` is only a broad bound because its one-second server-side value can cross the Kraken exchange-second boundary. Within each class a maximum-cardinality, minimum-time-distance matcher assigns copies globally.
 
 The comparison has explicit monotonic-clock boundaries: the app feed is subscribed first and warmed for 3 seconds, Kraken must acknowledge its subscription, then both active subscriptions are recorded for another 3-second overlapping sync. Nothing is cleared at the measurement boundary. A 2-second feed pre-roll protects copies that beat this process's direct Kraken socket. Both sockets remain recorded through the 10-second drain; sync and post-window Kraken trades are matching context only and never enter the verdict. This prevents equal-value trades outside the reference window from backfilling an in-window loss.
@@ -90,10 +94,14 @@ Run the deterministic edge/integration suite:
 npm test
 ```
 
-It attacks matching boundaries and duplicate bursts, the complete socket phase
-lifecycle with fake monotonic time, partial parser failures, atomic SQLite
-rollback/schema reset, authenticated API round-trips, and Telegram's 4096
-character limit. No live network or secrets are needed for the tests.
+For the built-in coverage report: `npm run test:coverage`.
+
+It attacks matching boundaries and duplicate bursts with an exhaustive oracle,
+the complete socket phase lifecycle with fake monotonic time, late callbacks,
+retry policy, numeric coercion and partial parser failures, verdict precedence,
+atomic SQLite rollback/schema reset, authenticated API abuse/round-trips, and
+Telegram's 4096 character limit. No live network or secrets are needed for the
+tests.
 
 No dependencies — the bot uses Node's built-in `WebSocket`, `fetch`, and `node:sqlite` (Node ≥ 22.13).
 

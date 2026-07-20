@@ -9,13 +9,14 @@ export function parseFeedTrade(raw, receivedAtMs, receivedMonoMs) {
   }
 
   const exchangeAtMs = parseExchangeTimeMs(payload?.time);
-  const price = Number(payload?.price);
-  const quantity = Number(payload?.quantity);
+  const price = parsePositiveNumber(payload?.price);
+  const quantity = parsePositiveNumber(payload?.quantity);
   const side = normalizeSide(payload?.type);
   if (
     exchangeAtMs === null ||
-    !Number.isFinite(price) ||
-    !Number.isFinite(quantity) ||
+    exchangeAtMs <= 0 ||
+    price === null ||
+    quantity === null ||
     side === null
   ) {
     return { trade: null, parseFailures: 1 };
@@ -52,13 +53,14 @@ export function parseKrakenMessage(raw, receivedAtMs, receivedMonoMs) {
   let parseFailures = 0;
   for (const rawTrade of payload.data) {
     const exchangeAtMs = parseExchangeTimeMs(rawTrade?.timestamp);
-    const price = Number(rawTrade?.price);
-    const quantity = Number(rawTrade?.qty);
+    const price = parsePositiveNumber(rawTrade?.price);
+    const quantity = parsePositiveNumber(rawTrade?.qty);
     const side = normalizeSide(rawTrade?.side);
     if (
       exchangeAtMs === null ||
-      !Number.isFinite(price) ||
-      !Number.isFinite(quantity) ||
+      exchangeAtMs <= 0 ||
+      price === null ||
+      quantity === null ||
       side === null
     ) {
       parseFailures += 1;
@@ -216,7 +218,9 @@ export function judgeProbe(session, metrics, slowDelayMs = 5_000) {
     };
   }
   if (metrics.matched === 0) return { verdict: "down", note: "no_matches" };
-  if (session.feed.closes > 0) return { verdict: "degraded", note: "socket_dropped" };
+  if (session.feed.closes > 0 || session.feed.errors > 0) {
+    return { verdict: "degraded", note: "socket_dropped" };
+  }
   if (metrics.feedParseFailures > 0) {
     return { verdict: "degraded", note: "invalid_feed_messages" };
   }
@@ -257,6 +261,18 @@ function parseExchangeTimeMs(value) {
 function normalizeSide(value) {
   const side = typeof value === "string" ? value.toLowerCase() : "";
   return side === "buy" || side === "sell" ? side : null;
+}
+
+function parsePositiveNumber(value) {
+  if (typeof value !== "number" && typeof value !== "string") return null;
+  if (
+    typeof value === "string" &&
+    !/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(value.trim())
+  ) {
+    return null;
+  }
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? number : null;
 }
 
 function groupIndices(values, keyForValue) {

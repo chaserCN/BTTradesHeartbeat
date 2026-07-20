@@ -99,6 +99,7 @@ export function collectSession(options, dependencies = {}) {
       }, connectTimeoutMs);
 
       krakenSocket.onopen = () => {
+        if (finished) return;
         session.kraken.connected = true;
         krakenSocket.send(JSON.stringify({
           method: "subscribe",
@@ -140,6 +141,7 @@ export function collectSession(options, dependencies = {}) {
         }
       };
       krakenSocket.onerror = () => {
+        if (finished) return;
         if (phase === "connecting_kraken") {
           session.kraken.connectFailed = true;
           finish();
@@ -175,6 +177,7 @@ export function collectSession(options, dependencies = {}) {
     }, connectTimeoutMs);
 
     feedSocket.onopen = () => {
+      if (finished) return;
       clearTimer(feedConnectTimer);
       session.feed.handshakeMs = wallNow() - connectionStartedAtMs;
       session.feed.subscribedAtMs = wallNow();
@@ -210,6 +213,7 @@ export function collectSession(options, dependencies = {}) {
       }
     };
     feedSocket.onerror = () => {
+      if (finished) return;
       session.feed.errors += 1;
       if (isPreMeasurementPhase(phase)) {
         session.feed.connectFailed = true;
