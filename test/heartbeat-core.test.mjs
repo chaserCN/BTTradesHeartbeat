@@ -103,18 +103,20 @@ test("a feed copy received before t0 can match its Kraken copy after t0", () => 
   assert.equal(metrics.allTrades[0].delayMs, 0);
 });
 
-test("side and exchange second prevent unrelated equal-value matches", () => {
+test("side prevents unrelated equal-value matches", () => {
   const reference = krakenTrade();
   const wrongSide = feedTrade({ side: "buy" });
-  const nextSecond = feedTrade({ exchangeAtMs: feedTrade().exchangeAtMs + 1_000 });
-  const metrics = computeTradeMetrics([reference], [wrongSide, nextSecond]);
+  const metrics = computeTradeMetrics([reference], [wrongSide]);
   assert.equal(metrics.matched, 0);
 });
 
-test("Kraken timestamps are rounded to the feed second at a second boundary", () => {
-  const reference = krakenTrade({ exchangeAtMs: baseExchangeAtMs + 755 }); // .949
-  const roundedFeed = feedTrade({ exchangeAtMs: Math.round(reference.exchangeAtMs / 1_000) * 1_000 });
-  const metrics = computeTradeMetrics([reference], [roundedFeed]);
+test("one-second feed time can cross the Kraken exchange-second boundary", () => {
+  const reference = krakenTrade({ exchangeAtMs: baseExchangeAtMs + 301 }); // .495301
+  const nextSecondFeed = feedTrade({
+    exchangeAtMs: (Math.floor(reference.exchangeAtMs / 1_000) + 1) * 1_000,
+    receivedMonoMs: reference.receivedMonoMs + 27,
+  });
+  const metrics = computeTradeMetrics([reference], [nextSecondFeed]);
   assert.equal(metrics.matched, 1);
 });
 
@@ -139,6 +141,15 @@ test("sub-millisecond Kraken precision is retained at the feed rounding boundary
   });
   assert.ok(Math.abs((kraken.exchangeAtMs % 1_000) - 499.6) < 0.001);
   assert.equal(computeTradeMetrics([kraken], [feed]).matched, 1);
+});
+
+test("exchange time remains a broad bound against distant identical values", () => {
+  const reference = krakenTrade();
+  const distant = feedTrade({
+    exchangeAtMs: reference.exchangeAtMs + 20_000,
+    receivedMonoMs: reference.receivedMonoMs + 20,
+  });
+  assert.equal(computeTradeMetrics([reference], [distant]).matched, 0);
 });
 
 test("a same-key trade outside the receive-time window cannot backfill a loss", () => {

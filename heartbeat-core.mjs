@@ -81,6 +81,7 @@ export function parseKrakenMessage(raw, receivedAtMs, receivedMonoMs) {
 export function computeTradeMetrics(reference, feedCandidates, options = {}) {
   const maxLeadMs = options.maxLeadMs ?? 2_000;
   const maxLagMs = options.maxLagMs ?? 10_000;
+  const maxExchangeSkewMs = options.maxExchangeSkewMs ?? Math.max(maxLeadMs, maxLagMs) + 1_000;
   const referencesByKey = groupIndices(reference, tradeMatchKey);
   const feedByKey = groupIndices(feedCandidates, tradeMatchKey);
   const matchedByReference = new Map();
@@ -92,6 +93,7 @@ export function computeTradeMetrics(reference, feedCandidates, options = {}) {
     const pairs = minimumCostMaximumPairs(reference, feedCandidates, referenceIndices, feedIndices, {
       maxLeadMs,
       maxLagMs,
+      maxExchangeSkewMs,
     });
     for (const pair of pairs) {
       matchedByReference.set(pair.referenceIndex, pair.feedIndex);
@@ -228,10 +230,10 @@ export function judgeProbe(session, metrics, slowDelayMs = 5_000) {
 }
 
 export function tradeMatchKey(trade) {
-  // The feed rounds Kraken's sub-second timestamp to the nearest Unix second
-  // (for example .949 becomes the next second), rather than flooring it.
-  const exchangeSecond = Math.round(trade.exchangeAtMs / 1_000);
-  return `${exchangeSecond}|${trade.price}|${trade.quantity}|${trade.side}`;
+  // Feed `time` has one-second precision and reflects server-side timing, so it
+  // can cross a second boundary even when the Kraken trade timestamp is .495.
+  // Keep it as an edge bound, not as an exact class dimension.
+  return `${trade.price}|${trade.quantity}|${trade.side}`;
 }
 
 function parseExchangeTimeMs(value) {
@@ -270,7 +272,8 @@ function groupIndices(values, keyForValue) {
 
 // Successive shortest augmenting paths give maximum cardinality first and,
 // among those matchings, the smallest total receive-time distance. Groups are
-// already exact exchange-second + value + side classes, so they remain small.
+// already exact value + side classes, while edge bounds keep them local in
+// exchange and receive time, so they remain small.
 function minimumCostMaximumPairs(reference, feed, referenceIndices, feedIndices, limits) {
   const source = 0;
   const referenceOffset = 1;
@@ -299,6 +302,9 @@ function minimumCostMaximumPairs(reference, feed, referenceIndices, feedIndices,
       const feedIndex = feedIndices[feedPosition];
       const signedDelayMs = feed[feedIndex].receivedMonoMs - reference[referenceIndex].receivedMonoMs;
       if (signedDelayMs < -limits.maxLeadMs || signedDelayMs > limits.maxLagMs) continue;
+      if (Math.abs(feed[feedIndex].exchangeAtMs - reference[referenceIndex].exchangeAtMs) > limits.maxExchangeSkewMs) {
+        continue;
+      }
       addEdge(
         referenceOffset + referencePosition,
         feedOffset + feedPosition,

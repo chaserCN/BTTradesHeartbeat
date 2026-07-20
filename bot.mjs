@@ -304,8 +304,8 @@ async function runManualCheck(chatId) {
 }
 
 // Opens one socket to our feed and one to Kraken, listens for a window,
-// cross-matches trades by exchange second + price + quantity + side and
-// produces a verdict. Receive times remain separate from exchange times.
+// cross-matches trades by price + quantity + side, bounded by exchange and
+// monotonic receive times. Receive times remain separate from exchange times.
 //
 // The feed server never acknowledges subscriptions and silently ignores bad
 // channels, so a quiet market and a dead feed look identical from our socket
