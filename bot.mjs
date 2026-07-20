@@ -5,6 +5,15 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 
+import {
+  analyzeLossRuns,
+  computeTradeMetrics,
+  judgeProbe,
+  parseFeedTrade,
+  parseKrakenMessage,
+  summarizeTradeResults,
+} from "./heartbeat-core.mjs";
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 loadLocalEnv(path.join(__dirname, ".env"));
@@ -18,6 +27,7 @@ const config = {
   krakenSymbol: process.env.KRAKEN_SYMBOL || "BTC/USD",
   probeIntervalMs: Math.max(5, Number(process.env.PROBE_INTERVAL_MINUTES || 60)) * 60_000,
   probeWarmupMs: Math.max(1, Number(process.env.PROBE_WARMUP_SECONDS || 3)) * 1000,
+  probePreRollMs: Math.max(1, Number(process.env.PROBE_PRE_ROLL_SECONDS || 2)) * 1000,
   probeWindowMs: Math.max(30, Number(process.env.PROBE_WINDOW_SECONDS || 90)) * 1000,
   probeDrainMs: Math.max(1, Number(process.env.PROBE_DRAIN_SECONDS || 10)) * 1000,
   connectTimeoutMs: Math.max(5, Number(process.env.CONNECT_TIMEOUT_SECONDS || 15)) * 1000,
@@ -47,20 +57,47 @@ const thresholds = {
 const expectedProbeDurationMs =
   (2 * config.probeWarmupMs) + (2 * config.connectTimeoutMs) + config.probeWindowMs + config.probeDrainMs;
 
-// Storage: SQLite (built into Node, no dependencies). Two data tables — one
-// row per probe ("проверка"), one row per lost trade ("сделка") — plus a
-// small kv table for service state. Probe ids are permanent, so /day labels
-// and /details <№> keep working forever; history is never trimmed.
+// Storage: SQLite (built into Node, no dependencies). This is a young internal
+// diagnostic bot, so probe history is disposable: incompatible schemas reset
+// the measurement tables instead of carrying migration code. Service kv state
+// survives the reset so Telegram offsets are not replayed.
+const SCHEMA_VERSION = 5;
 const db = new DatabaseSync(config.dbFile);
+db.exec("PRAGMA journal_mode = WAL;");
+const schemaVersion = db.prepare("PRAGMA user_version").get().user_version;
+if (schemaVersion !== SCHEMA_VERSION) {
+  db.exec(`
+    DROP TABLE IF EXISTS message_events;
+    DROP TABLE IF EXISTS feed_trades;
+    DROP TABLE IF EXISTS trades;
+    DROP TABLE IF EXISTS probes;
+  `);
+}
 db.exec(`
-  PRAGMA journal_mode = WAL;
   CREATE TABLE IF NOT EXISTS probes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     at TEXT NOT NULL,
+    measurement_started_at TEXT,
+    measurement_started_mono_ms REAL,
     verdict TEXT NOT NULL,
     note TEXT,
     window_seconds INTEGER,
     handshake_ms INTEGER,
+    subscribe_to_first_message_ms INTEGER,
+    subscribe_to_first_trade_ms INTEGER,
+    feed_messages INTEGER,
+    feed_parse_failures INTEGER,
+    measurement_feed_messages INTEGER,
+    measurement_feed_parse_failures INTEGER,
+    feed_parsed_trades INTEGER,
+    feed_warmup_trades INTEGER,
+    feed_sync_trades INTEGER,
+    kraken_messages INTEGER,
+    kraken_parse_failures INTEGER,
+    measurement_kraken_parse_failures INTEGER,
+    kraken_sync_trades INTEGER,
+    sync_matched INTEGER,
+    sync_coverage_pct INTEGER,
     kraken_trades INTEGER,
     our_trades INTEGER,
     reference_trades INTEGER,
@@ -69,6 +106,8 @@ db.exec(`
     delay_median_ms INTEGER,
     delay_slow_ms INTEGER,
     delay_max_ms INTEGER,
+    signed_delay_min_ms INTEGER,
+    signed_delay_median_ms INTEGER,
     feed_closes INTEGER,
     feed_errors INTEGER
   );
@@ -76,27 +115,53 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS trades (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     probe_id INTEGER NOT NULL REFERENCES probes(id),
-    at_ms INTEGER NOT NULL,
+    scope TEXT NOT NULL,
+    exchange_at_ms REAL NOT NULL,
+    kraken_received_at_ms INTEGER NOT NULL,
+    kraken_received_mono_ms REAL NOT NULL,
     price REAL NOT NULL,
     quantity REAL NOT NULL,
+    side TEXT NOT NULL,
+    kraken_trade_id TEXT,
     delivered INTEGER NOT NULL DEFAULT 0,
-    delay_ms INTEGER
+    feed_received_at_ms INTEGER,
+    signed_delay_ms INTEGER,
+    delay_ms INTEGER,
+    matched_feed_sequence INTEGER
   );
-  CREATE INDEX IF NOT EXISTS idx_trades_probe ON trades(probe_id);
+  CREATE INDEX IF NOT EXISTS idx_trades_probe ON trades(probe_id, scope);
+  CREATE TABLE IF NOT EXISTS feed_trades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    probe_id INTEGER NOT NULL REFERENCES probes(id),
+    sequence INTEGER NOT NULL,
+    phase TEXT NOT NULL,
+    exchange_at_ms REAL NOT NULL,
+    received_at_ms INTEGER NOT NULL,
+    received_mono_ms REAL NOT NULL,
+    price REAL NOT NULL,
+    quantity REAL NOT NULL,
+    side TEXT NOT NULL,
+    matched_scope TEXT,
+    UNIQUE(probe_id, sequence)
+  );
+  CREATE INDEX IF NOT EXISTS idx_feed_trades_probe ON feed_trades(probe_id, phase);
+  CREATE TABLE IF NOT EXISTS message_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    probe_id INTEGER NOT NULL REFERENCES probes(id),
+    source TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    phase TEXT NOT NULL,
+    received_at_ms INTEGER NOT NULL,
+    received_mono_ms REAL NOT NULL,
+    parsed_trades INTEGER NOT NULL,
+    parse_failures INTEGER NOT NULL,
+    raw_preview TEXT,
+    UNIQUE(probe_id, source, sequence)
+  );
+  CREATE INDEX IF NOT EXISTS idx_message_events_probe ON message_events(probe_id, source, phase);
   CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT);
+  PRAGMA user_version = ${SCHEMA_VERSION};
 `);
-
-// Earlier versions stored only lost trades in a lost_trades table; fold them
-// into the unified trades table (delivered = 0) once and drop the old table.
-if (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'lost_trades'").get()) {
-  db.exec(`
-    INSERT INTO trades (probe_id, at_ms, price, quantity, delivered)
-      SELECT probe_id, at_ms, price, quantity, 0 FROM lost_trades;
-    DROP TABLE lost_trades;
-  `);
-}
-
-importLegacyJsonState();
 
 // A second, read-only connection to the same file, used only by the HTTP API.
 // Declared here rather than in the API section because the server starts
@@ -119,6 +184,7 @@ console.log(
     `Reference: ${config.krakenUrl} (${config.krakenSymbol}). ` +
     `Interval: ${Math.round(config.probeIntervalMs / 60_000)} min, ` +
     `warmup: ${Math.round(config.probeWarmupMs / 1000)}s per subscription, ` +
+    `pre-roll: ${Math.round(config.probePreRollMs / 1000)}s, ` +
     `window: ${Math.round(config.probeWindowMs / 1000)}s, ` +
     `drain: ${Math.round(config.probeDrainMs / 1000)}s.` +
     `${config.dryRun ? " DRY_RUN: Telegram messages go to console." : ""}`,
@@ -238,7 +304,8 @@ async function runManualCheck(chatId) {
 }
 
 // Opens one socket to our feed and one to Kraken, listens for a window,
-// cross-matches trades by price+quantity and produces a verdict.
+// cross-matches trades by exchange second + price + quantity + side and
+// produces a verdict. Receive times remain separate from exchange times.
 //
 // The feed server never acknowledges subscriptions and silently ignores bad
 // channels, so a quiet market and a dead feed look identical from our socket
@@ -247,36 +314,90 @@ async function runProbe() {
   const startedAtMs = Date.now();
   const session = await collectSession(config.probeWindowMs, config.probeWarmupMs, config.probeDrainMs);
   const metrics = computeMetrics(session);
-  const verdict = judge(session, metrics);
+  const verdict = judgeProbe(session, metrics, thresholds.slowDelayMs);
+  const measurementStartedAt = session.measurementStartedAtMs === null
+    ? null
+    : new Date(session.measurementStartedAtMs).toISOString();
+  const feedWarmupTrades = session.feed.trades.filter(
+    (trade) => session.measurementStartedMonoMs !== null && trade.receivedMonoMs < session.measurementStartedMonoMs,
+  ).length;
+  const feedSyncTrades = session.feed.trades.filter((trade) => trade.phase === "syncing").length;
+  const measurementMatchedSequences = new Set(
+    metrics.allTrades.map((trade) => trade.matchedFeedSequence).filter((value) => value !== null),
+  );
+  const syncMatchedSequences = new Set(
+    metrics.sync.allTrades.map((trade) => trade.matchedFeedSequence).filter((value) => value !== null),
+  );
+  const drainMatchedSequences = new Set(
+    metrics.drain.allTrades.map((trade) => trade.matchedFeedSequence).filter((value) => value !== null),
+  );
 
   const probe = {
     at: new Date(startedAtMs).toISOString(),
+    measurementStartedAt,
+    measurementStartedMonoMs: session.measurementStartedMonoMs,
     verdict: verdict.verdict,
     note: verdict.note,
     windowSeconds: Math.round(session.windowMs / 1000),
     handshakeMs: session.feed.handshakeMs,
-    krakenTrades: session.kraken.trades.length,
-    ourTrades: session.feed.trades.length,
+    subscribeToFirstMessageMs: session.feed.subscribeToFirstMessageMs,
+    subscribeToFirstTradeMs: session.feed.subscribeToFirstTradeMs,
+    feedMessages: session.feed.messages,
+    feedParseFailures: session.feed.parseFailures,
+    measurementFeedMessages: metrics.feedMessages,
+    measurementFeedParseFailures: metrics.feedParseFailures,
+    feedParsedTrades: session.feed.trades.length,
+    feedWarmupTrades,
+    feedSyncTrades,
+    krakenMessages: session.kraken.messages,
+    krakenParseFailures: session.kraken.parseFailures,
+    measurementKrakenParseFailures: metrics.krakenParseFailures,
+    krakenSyncTrades: metrics.sync.referenceTrades,
+    syncMatched: metrics.sync.matched,
+    syncCoveragePct: metrics.sync.coveragePct,
+    krakenTrades: metrics.referenceTrades,
+    ourTrades: metrics.feedCandidates.length,
     referenceTrades: metrics.referenceTrades,
     matched: metrics.matched,
     coveragePct: metrics.coveragePct,
     delayMedianMs: metrics.delayMedianMs,
     delaySlowMs: metrics.delaySlowMs,
     delayMaxMs: metrics.delayMaxMs,
+    signedDelayMinMs: metrics.signedDelayMinMs,
+    signedDelayMedianMs: metrics.signedDelayMedianMs,
     feedCloses: session.feed.closes,
     feedErrors: session.feed.errors,
-    // Every reference trade with its delivered/lost status, kept for /details.
-    trades: metrics.allTrades.map((trade) => ({
-      atMs: trade.atMs,
-      price: trade.price,
-      quantity: trade.quantity,
-      delivered: trade.delivered,
-      delayMs: trade.delayMs,
+    // Every measurement and sync reference trade is retained. Every parsed
+    // feed trade is retained too, including unmatched warmup/drain records.
+    trades: metrics.allTrades,
+    syncTrades: metrics.sync.allTrades,
+    drainTrades: metrics.drain.allTrades,
+    messageEvents: [
+      ...session.feed.events.map((event) => ({ ...event, source: "feed" })),
+      ...session.kraken.events.map((event) => ({ ...event, source: "kraken" })),
+    ],
+    feedTrades: session.feed.trades.map((trade) => ({
+      ...trade,
+      matchedScope: measurementMatchedSequences.has(trade.sequence)
+        ? "measurement"
+        : syncMatchedSequences.has(trade.sequence)
+          ? "sync"
+          : drainMatchedSequences.has(trade.sequence)
+            ? "drain"
+            : null,
     })),
   };
   probe.lostTrades = probe.trades.filter((trade) => !trade.delivered);
 
-  console.log(`Probe: ${JSON.stringify({ ...probe, trades: probe.trades.length, lostTrades: probe.lostTrades.length })}`);
+  console.log(`Probe: ${JSON.stringify({
+    ...probe,
+    trades: probe.trades.length,
+    syncTrades: probe.syncTrades.length,
+    drainTrades: probe.drainTrades.length,
+    feedTrades: probe.feedTrades.length,
+    messageEvents: probe.messageEvents.length,
+    lostTrades: probe.lostTrades.length,
+  })}`);
   return probe;
 }
 
@@ -284,11 +405,37 @@ function collectSession(windowMs, warmupMs, drainMs) {
   return new Promise((resolve) => {
     const session = {
       windowMs: 0,
-      startedAtMs: null,
+      measurementStartedAtMs: null,
+      measurementStartedMonoMs: null,
       referenceEndedAtMs: null,
+      referenceEndedMonoMs: null,
       endedAtMs: null,
-      feed: { handshakeMs: null, connectFailed: false, trades: [], closes: 0, errors: 0 },
-      kraken: { connected: false, connectFailed: false, disconnected: false, trades: [] },
+      endedAtMonoMs: null,
+      syncStartedAtMs: null,
+      syncStartedMonoMs: null,
+      feed: {
+        handshakeMs: null,
+        connectFailed: false,
+        trades: [],
+        closes: 0,
+        errors: 0,
+        messages: 0,
+        parseFailures: 0,
+        events: [],
+        subscribedAtMs: null,
+        subscribedAtMonoMs: null,
+        subscribeToFirstMessageMs: null,
+        subscribeToFirstTradeMs: null,
+      },
+      kraken: {
+        connected: false,
+        connectFailed: false,
+        disconnected: false,
+        trades: [],
+        messages: 0,
+        parseFailures: 0,
+        events: [],
+      },
     };
 
     const connectionStartedAtMs = Date.now();
@@ -311,8 +458,10 @@ function collectSession(windowMs, warmupMs, drainMs) {
         if (timer) clearTimeout(timer);
       }
       session.endedAtMs = Date.now();
-      if (session.startedAtMs !== null) {
-        session.windowMs = (session.referenceEndedAtMs ?? session.endedAtMs) - session.startedAtMs;
+      session.endedAtMonoMs = performance.now();
+      if (session.measurementStartedMonoMs !== null) {
+        session.windowMs =
+          (session.referenceEndedMonoMs ?? session.endedAtMonoMs) - session.measurementStartedMonoMs;
       }
       for (const socket of [feedSocket, krakenSocket]) {
         try { socket?.close(); } catch { /* already closed */ }
@@ -323,21 +472,22 @@ function collectSession(windowMs, warmupMs, drainMs) {
     const beginMeasurement = () => {
       if (finished || phase !== "syncing") return;
 
-      // Both subscriptions are ready. Discard everything seen during setup so
-      // the reference and feed start at the same boundary.
-      session.feed.trades = [];
-      session.kraken.trades = [];
-      session.startedAtMs = Date.now();
+      // Keep the overlapping sync history. Exact monotonic boundaries select
+      // the measurement reference later; the feed pre-roll remains available
+      // for copies that reached this process before Kraken did.
+      session.measurementStartedAtMs = Date.now();
+      session.measurementStartedMonoMs = performance.now();
       phase = "measuring";
 
       measurementTimer = setTimeout(() => {
         if (finished || phase !== "measuring") return;
         session.referenceEndedAtMs = Date.now();
+        session.referenceEndedMonoMs = performance.now();
         phase = "draining";
 
-        // The reference window is now fixed. Stop Kraken and give only our
-        // feed extra time to deliver trades emitted just before the boundary.
-        try { krakenSocket?.close(); } catch { /* already closed */ }
+        // The reference window is fixed, but keep Kraken open during drain as
+        // non-verdict context. Post-window Kraken trades reserve their own feed
+        // copies so an equal-value new trade cannot backfill an in-window loss.
         drainTimer = setTimeout(finish, drainMs);
       }, windowMs);
     };
@@ -370,9 +520,25 @@ function collectSession(windowMs, warmupMs, drainMs) {
         );
       };
       krakenSocket.onmessage = (event) => {
-        const message = parseKrakenMessage(event.data);
+        if (finished) return;
+        const receivedAtMs = Date.now();
+        const receivedMonoMs = performance.now();
+        session.kraken.messages += 1;
+        const message = parseKrakenMessage(event.data, receivedAtMs, receivedMonoMs);
+        session.kraken.parseFailures += message.parseFailures;
+        session.kraken.events.push({
+          sequence: session.kraken.messages,
+          phase,
+          receivedAtMs,
+          receivedMonoMs,
+          parsedTrades: message.trades.length,
+          parseFailures: message.parseFailures,
+          rawPreview: message.parseFailures > 0 ? previewRawMessage(event.data) : null,
+        });
         if (message.subscription === "accepted" && phase === "connecting_kraken") {
           clearTimeout(krakenConnectTimer);
+          session.syncStartedAtMs = receivedAtMs;
+          session.syncStartedMonoMs = receivedMonoMs;
           phase = "syncing";
           syncTimer = setTimeout(beginMeasurement, warmupMs);
           return;
@@ -383,8 +549,8 @@ function collectSession(windowMs, warmupMs, drainMs) {
           finish();
           return;
         }
-        if (phase === "measuring") {
-          session.kraken.trades.push(...message.trades);
+        if (phase === "syncing" || phase === "measuring" || phase === "draining") {
+          session.kraken.trades.push(...message.trades.map((trade) => ({ ...trade, phase })));
         }
       };
       krakenSocket.onerror = () => {
@@ -425,14 +591,40 @@ function collectSession(windowMs, warmupMs, drainMs) {
     feedSocket.onopen = () => {
       clearTimeout(feedConnectTimer);
       session.feed.handshakeMs = Date.now() - connectionStartedAtMs;
+      session.feed.subscribedAtMs = Date.now();
+      session.feed.subscribedAtMonoMs = performance.now();
       feedSocket.send(JSON.stringify({ subscribe: config.feedChannel }));
       phase = "warming_feed";
       warmupTimer = setTimeout(connectKraken, warmupMs);
     };
     feedSocket.onmessage = (event) => {
-      if (phase === "measuring" || phase === "draining") {
-        const trade = parseFeedTrade(event.data);
-        if (trade) session.feed.trades.push(trade);
+      if (finished) return;
+      const receivedAtMs = Date.now();
+      const receivedMonoMs = performance.now();
+      session.feed.messages += 1;
+      if (session.feed.subscribeToFirstMessageMs === null && session.feed.subscribedAtMonoMs !== null) {
+        session.feed.subscribeToFirstMessageMs = Math.round(receivedMonoMs - session.feed.subscribedAtMonoMs);
+      }
+      const parsed = parseFeedTrade(event.data, receivedAtMs, receivedMonoMs);
+      session.feed.parseFailures += parsed.parseFailures;
+      session.feed.events.push({
+        sequence: session.feed.messages,
+        phase,
+        receivedAtMs,
+        receivedMonoMs,
+        parsedTrades: parsed.trade ? 1 : 0,
+        parseFailures: parsed.parseFailures,
+        rawPreview: parsed.parseFailures > 0 ? previewRawMessage(event.data) : null,
+      });
+      if (parsed.trade) {
+        if (session.feed.subscribeToFirstTradeMs === null && session.feed.subscribedAtMonoMs !== null) {
+          session.feed.subscribeToFirstTradeMs = Math.round(receivedMonoMs - session.feed.subscribedAtMonoMs);
+        }
+        session.feed.trades.push({
+          ...parsed.trade,
+          phase,
+          sequence: session.feed.messages,
+        });
       }
     };
     feedSocket.onerror = () => {
@@ -453,146 +645,164 @@ function collectSession(windowMs, warmupMs, drainMs) {
   });
 }
 
-function parseFeedTrade(raw) {
-  let payload;
-  try {
-    payload = JSON.parse(raw);
-  } catch {
-    return null;
-  }
-  if (payload?.price == null || payload?.quantity == null || payload?.time == null) return null;
-  const price = Number(payload.price);
-  const quantity = Number(payload.quantity);
-  if (!Number.isFinite(price) || !Number.isFinite(quantity)) return null;
-  return { atMs: Date.now(), price, quantity };
-}
-
-function parseKrakenMessage(raw) {
-  let payload;
-  try {
-    payload = JSON.parse(raw);
-  } catch {
-    return { subscription: null, error: null, trades: [] };
-  }
-
-  if (payload?.method === "subscribe") {
+function computeMetrics(session) {
+  if (session.measurementStartedMonoMs === null) {
     return {
-      subscription: payload.success === true ? "accepted" : "rejected",
-      error: payload.error || null,
-      trades: [],
+      ...computeTradeMetrics([], []),
+      feedCandidates: [],
+      sync: computeTradeMetrics([], []),
+      drain: computeTradeMetrics([], []),
+      feedMessages: 0,
+      feedParseFailures: 0,
+      krakenParseFailures: 0,
     };
   }
 
-  if (payload?.channel !== "trade" || payload?.type !== "update" || !Array.isArray(payload.data)) {
-    return { subscription: null, error: null, trades: [] };
-  }
-
-  const receivedAtMs = Date.now();
-  const trades = payload.data
-    .map((trade) => ({
-      atMs: receivedAtMs,
-      price: Number(trade.price),
-      quantity: Number(trade.qty),
-    }))
-    .filter((trade) => Number.isFinite(trade.price) && Number.isFinite(trade.quantity));
-  return { subscription: null, error: null, trades };
-}
-
-function computeMetrics(session) {
-  // Kraken stops at the reference boundary while our feed keeps draining, so
-  // every reference trade has had the full delivery grace period.
-  const reference = session.kraken.trades;
-
-  const usedFeedIndices = new Set();
-  const delays = [];
-  const allTrades = [];
-  for (const krakenTrade of reference) {
-    const index = session.feed.trades.findIndex(
-      (feedTrade, feedIndex) =>
-        !usedFeedIndices.has(feedIndex) &&
-        Math.abs(feedTrade.price - krakenTrade.price) < 1e-9 &&
-        Math.abs(feedTrade.quantity - krakenTrade.quantity) < 1e-9,
-    );
-    if (index >= 0) {
-      usedFeedIndices.add(index);
-      const delayMs = Math.max(0, session.feed.trades[index].atMs - krakenTrade.atMs);
-      delays.push(delayMs);
-      allTrades.push({ ...krakenTrade, delivered: true, delayMs });
-    } else {
-      allTrades.push({ ...krakenTrade, delivered: false, delayMs: null });
-    }
-  }
-
-  delays.sort((lhs, rhs) => lhs - rhs);
+  const referenceEnd = session.referenceEndedMonoMs ?? session.endedAtMonoMs ?? performance.now();
+  const contextStart = session.syncStartedMonoMs ?? session.measurementStartedMonoMs;
+  const contextEnd = session.endedAtMonoMs ?? performance.now();
+  const contextReference = session.kraken.trades.filter(
+    (trade) => trade.receivedMonoMs >= contextStart && trade.receivedMonoMs <= contextEnd,
+  );
+  const contextFeedCandidates = session.feed.trades.filter(
+    (trade) =>
+      trade.receivedMonoMs >= contextStart - config.probePreRollMs &&
+      trade.receivedMonoMs <= contextEnd,
+  );
+  const context = computeTradeMetrics(contextReference, contextFeedCandidates, {
+    maxLeadMs: config.probePreRollMs,
+    maxLagMs: config.probeDrainMs,
+  });
+  const measurementTrades = context.allTrades.filter(
+    (trade) =>
+      trade.receivedMonoMs >= session.measurementStartedMonoMs && trade.receivedMonoMs < referenceEnd,
+  );
+  const feedCandidates = session.feed.trades.filter(
+    (trade) =>
+      trade.receivedMonoMs >= session.measurementStartedMonoMs - config.probePreRollMs &&
+      trade.receivedMonoMs <= referenceEnd + config.probeDrainMs,
+  );
+  const syncTrades = context.allTrades.filter(
+    (trade) => trade.receivedMonoMs < session.measurementStartedMonoMs,
+  );
+  const drainTrades = context.allTrades.filter((trade) => trade.receivedMonoMs >= referenceEnd);
+  const measurementFeedEvents = session.feed.events.filter(
+    (event) =>
+      event.receivedMonoMs >= session.measurementStartedMonoMs && event.receivedMonoMs <= contextEnd,
+  );
+  const measurementKrakenEvents = session.kraken.events.filter(
+    (event) =>
+      event.receivedMonoMs >= session.measurementStartedMonoMs && event.receivedMonoMs < referenceEnd,
+  );
   return {
-    referenceTrades: reference.length,
-    allTrades,
-    matched: delays.length,
-    coveragePct: reference.length ? Math.round((delays.length / reference.length) * 100) : null,
-    delayMedianMs: delays.length ? delays[Math.floor(delays.length / 2)] : null,
-    delaySlowMs: delays.length ? delays[Math.min(delays.length - 1, Math.floor(delays.length * 0.9))] : null,
-    delayMaxMs: delays.length ? delays[delays.length - 1] : null,
+    ...summarizeTradeResults(measurementTrades),
+    feedCandidates,
+    sync: summarizeTradeResults(syncTrades),
+    drain: summarizeTradeResults(drainTrades),
+    feedMessages: measurementFeedEvents.length,
+    feedParseFailures: measurementFeedEvents.reduce((sum, event) => sum + event.parseFailures, 0),
+    krakenParseFailures: measurementKrakenEvents.reduce((sum, event) => sum + event.parseFailures, 0),
   };
 }
 
-function judge(session, metrics) {
-  if (session.feed.connectFailed) {
-    return { verdict: "down", note: "connect_failed" };
-  }
-  if (session.kraken.disconnected) {
-    // A partial reference can hide trades lost by our feed, so never judge
-    // against it even if Kraken delivered a few trades before disconnecting.
-    return { verdict: "inconclusive", note: "kraken_disconnected" };
-  }
-  if (session.kraken.connectFailed) {
-    // Cannot judge without the reference. Do not blame our feed.
-    return { verdict: "inconclusive", note: "kraken_unavailable" };
-  }
-  if (session.kraken.trades.length === 0) {
-    return { verdict: "inconclusive", note: "quiet_market" };
-  }
-  if (session.feed.trades.length === 0) {
-    return { verdict: "down", note: "feed_silent" };
-  }
-  if (metrics.matched === 0) {
-    return { verdict: "down", note: "no_matches" };
-  }
-  if (session.feed.closes > 0) {
-    return { verdict: "degraded", note: "socket_dropped" };
-  }
-  if (metrics.matched < metrics.referenceTrades) {
-    return { verdict: "degraded", note: "missing_trades" };
-  }
-  if (metrics.delaySlowMs !== null && metrics.delaySlowMs > thresholds.slowDelayMs) {
-    return { verdict: "degraded", note: "slow_delivery" };
-  }
-  return { verdict: "ok", note: "" };
+function previewRawMessage(raw) {
+  const text = typeof raw === "string"
+    ? raw
+    : raw instanceof ArrayBuffer
+      ? Buffer.from(raw).toString("utf8")
+      : ArrayBuffer.isView(raw)
+        ? Buffer.from(raw.buffer, raw.byteOffset, raw.byteLength).toString("utf8")
+        : String(raw);
+  return text.slice(0, 500);
 }
 
 function recordProbe(probe) {
-  const info = db.prepare(`
-    INSERT INTO probes (
-      at, verdict, note, window_seconds, handshake_ms, kraken_trades, our_trades,
-      reference_trades, matched, coverage_pct, delay_median_ms, delay_slow_ms,
-      delay_max_ms, feed_closes, feed_errors
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    probe.at, probe.verdict, probe.note ?? null, probe.windowSeconds ?? null,
-    probe.handshakeMs ?? null, probe.krakenTrades ?? null, probe.ourTrades ?? null,
-    probe.referenceTrades ?? null, probe.matched ?? null, probe.coveragePct ?? null,
-    probe.delayMedianMs ?? null, probe.delaySlowMs ?? null, probe.delayMaxMs ?? null,
-    probe.feedCloses ?? null, probe.feedErrors ?? null,
-  );
-  probe.id = Number(info.lastInsertRowid);
-  insertTrades(probe.id, probe.trades || []);
+  db.exec("BEGIN");
+  try {
+    const info = db.prepare(`
+      INSERT INTO probes (
+        at, measurement_started_at, measurement_started_mono_ms, verdict, note, window_seconds, handshake_ms,
+        subscribe_to_first_message_ms, subscribe_to_first_trade_ms,
+        feed_messages, feed_parse_failures, measurement_feed_messages, measurement_feed_parse_failures,
+        feed_parsed_trades, feed_warmup_trades, feed_sync_trades,
+        kraken_messages, kraken_parse_failures, measurement_kraken_parse_failures,
+        kraken_sync_trades, sync_matched, sync_coverage_pct,
+        kraken_trades, our_trades, reference_trades, matched, coverage_pct,
+        delay_median_ms, delay_slow_ms, delay_max_ms, signed_delay_min_ms, signed_delay_median_ms,
+        feed_closes, feed_errors
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      probe.at, probe.measurementStartedAt ?? null, probe.measurementStartedMonoMs ?? null,
+      probe.verdict, probe.note ?? null,
+      probe.windowSeconds ?? null, probe.handshakeMs ?? null,
+      probe.subscribeToFirstMessageMs ?? null, probe.subscribeToFirstTradeMs ?? null,
+      probe.feedMessages ?? null, probe.feedParseFailures ?? null,
+      probe.measurementFeedMessages ?? null, probe.measurementFeedParseFailures ?? null,
+      probe.feedParsedTrades ?? null, probe.feedWarmupTrades ?? null, probe.feedSyncTrades ?? null,
+      probe.krakenMessages ?? null, probe.krakenParseFailures ?? null,
+      probe.measurementKrakenParseFailures ?? null, probe.krakenSyncTrades ?? null,
+      probe.syncMatched ?? null, probe.syncCoveragePct ?? null,
+      probe.krakenTrades ?? null, probe.ourTrades ?? null, probe.referenceTrades ?? null,
+      probe.matched ?? null, probe.coveragePct ?? null, probe.delayMedianMs ?? null,
+      probe.delaySlowMs ?? null, probe.delayMaxMs ?? null, probe.signedDelayMinMs ?? null,
+      probe.signedDelayMedianMs ?? null, probe.feedCloses ?? null, probe.feedErrors ?? null,
+    );
+    probe.id = Number(info.lastInsertRowid);
+    insertReferenceTrades(probe.id, "measurement", probe.trades || []);
+    insertReferenceTrades(probe.id, "sync", probe.syncTrades || []);
+    insertReferenceTrades(probe.id, "drain", probe.drainTrades || []);
+    insertFeedTrades(probe.id, probe.feedTrades || []);
+    insertMessageEvents(probe.id, probe.messageEvents || []);
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
 }
 
-function insertTrades(probeId, trades) {
+function insertReferenceTrades(probeId, scope, trades) {
   const statement = db.prepare(
-    "INSERT INTO trades (probe_id, at_ms, price, quantity, delivered, delay_ms) VALUES (?, ?, ?, ?, ?, ?)",
+    `INSERT INTO trades (
+      probe_id, scope, exchange_at_ms, kraken_received_at_ms, kraken_received_mono_ms, price, quantity, side,
+      kraken_trade_id, delivered, feed_received_at_ms, signed_delay_ms, delay_ms, matched_feed_sequence
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   for (const trade of trades) {
-    statement.run(probeId, trade.atMs, trade.price, trade.quantity, trade.delivered ? 1 : 0, trade.delayMs ?? null);
+    statement.run(
+      probeId, scope, trade.exchangeAtMs, trade.receivedAtMs, trade.receivedMonoMs, trade.price, trade.quantity,
+      trade.side, trade.tradeId ?? null, trade.delivered ? 1 : 0, trade.feedReceivedAtMs ?? null,
+      trade.signedDelayMs ?? null, trade.delayMs ?? null, trade.matchedFeedSequence ?? null,
+    );
+  }
+}
+
+function insertFeedTrades(probeId, trades) {
+  const statement = db.prepare(
+    `INSERT INTO feed_trades (
+      probe_id, sequence, phase, exchange_at_ms, received_at_ms, received_mono_ms,
+      price, quantity, side, matched_scope
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  for (const trade of trades) {
+    statement.run(
+      probeId, trade.sequence, trade.phase, trade.exchangeAtMs, trade.receivedAtMs, trade.receivedMonoMs,
+      trade.price, trade.quantity, trade.side, trade.matchedScope ?? null,
+    );
+  }
+}
+
+function insertMessageEvents(probeId, events) {
+  const statement = db.prepare(
+    `INSERT INTO message_events (
+      probe_id, source, sequence, phase, received_at_ms, received_mono_ms,
+      parsed_trades, parse_failures, raw_preview
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+  for (const event of events) {
+    statement.run(
+      probeId, event.source, event.sequence, event.phase, event.receivedAtMs, event.receivedMonoMs,
+      event.parsedTrades, event.parseFailures, event.rawPreview ?? null,
+    );
   }
 }
 
@@ -601,10 +811,27 @@ function rowToProbe(row) {
   return {
     id: row.id,
     at: row.at,
+    measurementStartedAt: row.measurement_started_at,
+    measurementStartedMonoMs: row.measurement_started_mono_ms,
     verdict: row.verdict,
     note: row.note ?? "",
     windowSeconds: row.window_seconds,
     handshakeMs: row.handshake_ms,
+    subscribeToFirstMessageMs: row.subscribe_to_first_message_ms,
+    subscribeToFirstTradeMs: row.subscribe_to_first_trade_ms,
+    feedMessages: row.feed_messages,
+    feedParseFailures: row.feed_parse_failures,
+    measurementFeedMessages: row.measurement_feed_messages,
+    measurementFeedParseFailures: row.measurement_feed_parse_failures,
+    feedParsedTrades: row.feed_parsed_trades,
+    feedWarmupTrades: row.feed_warmup_trades,
+    feedSyncTrades: row.feed_sync_trades,
+    krakenMessages: row.kraken_messages,
+    krakenParseFailures: row.kraken_parse_failures,
+    measurementKrakenParseFailures: row.measurement_kraken_parse_failures,
+    krakenSyncTrades: row.kraken_sync_trades,
+    syncMatched: row.sync_matched,
+    syncCoveragePct: row.sync_coverage_pct,
     krakenTrades: row.kraken_trades,
     ourTrades: row.our_trades,
     referenceTrades: row.reference_trades,
@@ -613,6 +840,8 @@ function rowToProbe(row) {
     delayMedianMs: row.delay_median_ms,
     delaySlowMs: row.delay_slow_ms,
     delayMaxMs: row.delay_max_ms,
+    signedDelayMinMs: row.signed_delay_min_ms,
+    signedDelayMedianMs: row.signed_delay_median_ms,
     feedCloses: row.feed_closes,
     feedErrors: row.feed_errors,
   };
@@ -633,23 +862,78 @@ function getProbesSince(sinceMs) {
     .map(rowToProbe);
 }
 
-function getTrades(probeId) {
+function getTrades(probeId, scope = "measurement") {
   return db
-    .prepare("SELECT at_ms, price, quantity, delivered, delay_ms FROM trades WHERE probe_id = ? ORDER BY at_ms, id")
-    .all(probeId)
+    .prepare(`SELECT
+      exchange_at_ms, kraken_received_at_ms, kraken_received_mono_ms, price, quantity, side, kraken_trade_id,
+      delivered, feed_received_at_ms, signed_delay_ms, delay_ms, matched_feed_sequence
+      FROM trades WHERE probe_id = ? AND scope = ? ORDER BY exchange_at_ms, kraken_received_at_ms, id`)
+    .all(probeId, scope)
     .map((row) => ({
-      atMs: row.at_ms,
+      exchangeAtMs: row.exchange_at_ms,
+      receivedAtMs: row.kraken_received_at_ms,
+      receivedMonoMs: row.kraken_received_mono_ms,
       price: row.price,
       quantity: row.quantity,
+      side: row.side,
+      tradeId: row.kraken_trade_id,
       delivered: row.delivered === 1,
+      feedReceivedAtMs: row.feed_received_at_ms,
+      signedDelayMs: row.signed_delay_ms,
       delayMs: row.delay_ms,
+      matchedFeedSequence: row.matched_feed_sequence,
+    }));
+}
+
+function getFeedTrades(probeId) {
+  return db
+    .prepare(`SELECT sequence, phase, exchange_at_ms, received_at_ms, received_mono_ms,
+        price, quantity, side, matched_scope
+      FROM feed_trades WHERE probe_id = ? ORDER BY sequence`)
+    .all(probeId)
+    .map((row) => ({
+      sequence: row.sequence,
+      phase: row.phase,
+      exchangeAtMs: row.exchange_at_ms,
+      receivedAtMs: row.received_at_ms,
+      receivedMonoMs: row.received_mono_ms,
+      price: row.price,
+      quantity: row.quantity,
+      side: row.side,
+      matchedScope: row.matched_scope,
+    }));
+}
+
+function getMessageEvents(probeId) {
+  return db
+    .prepare(`SELECT source, sequence, phase, received_at_ms, received_mono_ms,
+        parsed_trades, parse_failures, raw_preview
+      FROM message_events WHERE probe_id = ? ORDER BY received_at_ms, id`)
+    .all(probeId)
+    .map((row) => ({
+      source: row.source,
+      sequence: row.sequence,
+      phase: row.phase,
+      receivedAtMs: row.received_at_ms,
+      receivedMonoMs: row.received_mono_ms,
+      parsedTrades: row.parsed_trades,
+      parseFailures: row.parse_failures,
+      rawPreview: row.raw_preview,
     }));
 }
 
 function withTrades(probe) {
   if (!probe) return null;
   const trades = getTrades(probe.id);
-  return { ...probe, trades, lostTrades: trades.filter((trade) => !trade.delivered) };
+  return {
+    ...probe,
+    trades,
+    syncTrades: getTrades(probe.id, "sync"),
+    drainTrades: getTrades(probe.id, "drain"),
+    feedTrades: getFeedTrades(probe.id),
+    messageEvents: getMessageEvents(probe.id),
+    lostTrades: trades.filter((trade) => !trade.delivered),
+  };
 }
 
 function kvGet(key) {
@@ -660,49 +944,6 @@ function kvSet(key, value) {
   db.prepare(
     "INSERT INTO kv (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
   ).run(key, String(value));
-}
-
-// One-time import of the pre-SQLite JSON state file, preserving probe numbers.
-// The JSON file is renamed afterwards so the import never runs twice.
-function importLegacyJsonState() {
-  const legacyFile = path.join(path.dirname(config.dbFile), "heartbeat_state.json");
-  if (!fs.existsSync(legacyFile)) return;
-
-  let legacy;
-  try {
-    legacy = JSON.parse(fs.readFileSync(legacyFile, "utf8"));
-  } catch (error) {
-    console.error(`Cannot parse legacy state file, skipping import: ${error.message}`);
-    return;
-  }
-
-  const hasProbes = db.prepare("SELECT id FROM probes LIMIT 1").get();
-  if (!hasProbes) {
-    const insert = db.prepare(`
-      INSERT INTO probes (
-        id, at, verdict, note, window_seconds, handshake_ms, kraken_trades, our_trades,
-        reference_trades, matched, coverage_pct, delay_median_ms, delay_slow_ms,
-        delay_max_ms, feed_closes, feed_errors
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-    for (const entry of legacy.history || []) {
-      insert.run(
-        entry.id ?? null, entry.at, entry.verdict, entry.note ?? null,
-        entry.windowSeconds ?? null, entry.handshakeMs ?? null, entry.krakenTrades ?? null,
-        entry.ourTrades ?? null, entry.referenceTrades ?? null, entry.matched ?? null,
-        entry.coveragePct ?? null, entry.delayMedianMs ?? null, entry.delaySlowMs ?? null,
-        entry.delayMaxMs ?? null, entry.feedCloses ?? null, entry.feedErrors ?? null,
-      );
-      if (entry.id != null && Array.isArray(entry.lostTrades)) {
-        insertTrades(entry.id, entry.lostTrades.map((trade) => ({ ...trade, delivered: false })));
-      }
-    }
-    if (legacy.telegramUpdateOffset != null) kvSet("telegramUpdateOffset", legacy.telegramUpdateOffset);
-    if (legacy.lastNotifiedVerdict) kvSet("lastNotifiedVerdict", legacy.lastNotifiedVerdict);
-    console.log(`Imported ${(legacy.history || []).length} probes from legacy JSON state.`);
-  }
-
-  fs.renameSync(legacyFile, `${legacyFile}.imported`);
 }
 
 // --- notifications ---------------------------------------------------------
@@ -809,7 +1050,9 @@ function formatManualCheckMessage(probe) {
 }
 
 function isKrakenReferenceFailure(probe) {
-  return probe.note === "kraken_unavailable" || probe.note === "kraken_disconnected";
+  return probe.note === "kraken_unavailable" ||
+    probe.note === "kraken_disconnected" ||
+    probe.note === "kraken_parse_failure";
 }
 
 function describeInconclusiveDetail(probe) {
@@ -818,6 +1061,9 @@ function describeInconclusiveDetail(probe) {
   }
   if (probe.note === "kraken_unavailable") {
     return "Біржа Kraken була недоступна, тому стан BitcoinTicker оцінити неможливо.";
+  }
+  if (probe.note === "kraken_parse_failure") {
+    return "Kraken надіслав пошкоджене або неочікуване повідомлення під час вікна. Еталон неповний, тому стан BitcoinTicker оцінити неможливо.";
   }
   return "За час перевірки Kraken не передав жодної угоди, тому порівнювати нема чого. Спробуйте /check трохи пізніше.";
 }
@@ -834,6 +1080,8 @@ function describeProblemDetail(probe) {
       return probe.ourTrades > 0
         ? `Біржа показала ${probe.krakenTrades} ${tradesWord(probe.krakenTrades)}, сервер надіслав ${probe.ourTrades} повідомлень, але реальних угод з біржі серед них немає — дані не збігаються.`
         : `Біржа показала ${probe.krakenTrades} ${tradesWord(probe.krakenTrades)} за ${probe.windowSeconds} с, наш сервер не передав жодної.`;
+    case "invalid_feed_messages":
+      return `Фід надіслав ${probe.measurementFeedMessages} повідомлень, але ${probe.measurementFeedParseFailures} з них не вдалося розібрати. Дані фіда пошкоджені або змінили формат.`;
     case "socket_dropped":
       return `Сервер обривав з'єднання під час перевірки. Дійшло ${probe.matched} з ${total} угод (${probe.coveragePct}%).`;
     case "missing_trades":
@@ -868,6 +1116,21 @@ function formatDetailsMessages(probe) {
   if (probe.handshakeMs !== null && probe.handshakeMs !== undefined) {
     lines.push(`Підключення: ${formatDelay(probe.handshakeMs)}`);
   }
+  if (probe.subscribeToFirstTradeMs !== null && probe.subscribeToFirstTradeMs !== undefined) {
+    lines.push(`Перша угода після підписки: ${formatDelay(probe.subscribeToFirstTradeMs)}`);
+  }
+  if (probe.krakenSyncTrades > 0) {
+    lines.push(
+      `Перекривний прогрів: ${probe.syncMatched} з ${probe.krakenSyncTrades}` +
+        `${probe.syncCoveragePct !== null ? ` (${probe.syncCoveragePct}%)` : ""}`,
+    );
+  }
+  if (probe.measurementFeedParseFailures || probe.measurementKrakenParseFailures) {
+    lines.push(
+      `Помилки розбору у вікні: feed ${probe.measurementFeedParseFailures || 0}, ` +
+        `Kraken ${probe.measurementKrakenParseFailures || 0}`,
+    );
+  }
   if (probe.feedCloses || probe.feedErrors) {
     lines.push(`Обриви з'єднання: ${probe.feedCloses}, помилки сокета: ${probe.feedErrors}`);
   }
@@ -889,27 +1152,12 @@ function formatDetailsMessages(probe) {
   // split into as many <pre> blocks (one per message) as needed — never
   // truncated.
   const trades = probe.trades || [];
-  const pattern = describeLossPattern(lost);
-
-  if (!trades.some((trade) => trade.delivered)) {
-    // Old records stored only the lost trades — show what survived.
-    lines.push("", "<b>Загублені угоди</b> (час · ціна · обсяг)");
-    const shown = lost.slice(0, 10);
-    const priceWidth = Math.max(...shown.map((trade) => String(trade.price).length));
-    for (const trade of shown) {
-      lines.push(`<code>${formatTimeWithSeconds(trade.atMs)}  ${String(trade.price).padStart(priceWidth)}  ${trade.quantity}</code>`);
-    }
-    if (lost.length > shown.length) {
-      lines.push(`…і ще ${lost.length - shown.length}.`);
-    }
-    lines.push("", pattern);
-    return [lines.join("\n")];
-  }
+  const pattern = describeLossPattern(trades);
 
   lines.push("", "<b>Угоди</b> (✓ дійшла · ✗ загублена)");
   const priceWidth = Math.max(...trades.map((trade) => String(trade.price).length));
   const rows = trades.map((trade) =>
-    `${trade.delivered ? "✓" : "✗"} ${formatTimeWithSeconds(trade.atMs)}  ${String(trade.price).padStart(priceWidth)}  ${trade.quantity}`,
+    `${trade.delivered ? "✓" : "✗"} ${formatTimeWithSeconds(trade.exchangeAtMs)}  ${String(trade.price).padStart(priceWidth)}  ${trade.quantity} ${trade.side}`,
   );
   const blocks = chunkRowsByLength(rows, 3500).map((chunk) => `<pre>${chunk.join("\n")}</pre>`);
 
@@ -955,11 +1203,13 @@ function detailsHeadline(probe) {
   if (probe.verdict === "ok") return "сервер працював нормально";
   if (probe.note === "kraken_disconnected") return "Kraken розірвав з’єднання";
   if (probe.note === "kraken_unavailable") return "Kraken був недоступний";
+  if (probe.note === "kraken_parse_failure") return "повідомлення Kraken не вдалося розібрати";
   if (probe.verdict === "inconclusive") return "ринок був надто тихий, щоб оцінити";
   const label = {
     connect_failed: "сервер не відповідав",
     feed_silent: "угоди не доходили",
     no_matches: "дані не збігалися з біржею",
+    invalid_feed_messages: "фід надсилав пошкоджені дані",
     missing_trades: "частина угод губилася",
     slow_delivery: "угоди доходили із запізненням",
     socket_dropped: "сервер обривав з'єднання",
@@ -967,32 +1217,26 @@ function detailsHeadline(probe) {
   return label || (probe.verdict === "down" ? "сервер не працював" : "сервер працював з перебоями");
 }
 
-// Were the losses bursts (buffer stall) or spread out (overloaded fan-out)?
-function describeLossPattern(lost) {
-  if (lost.length < 3) {
-    return "Втрат замало, щоб судити про закономірність.";
-  }
-  const bursts = [];
-  let current = [lost[0]];
-  for (let index = 1; index < lost.length; index += 1) {
-    if (lost[index].atMs - lost[index - 1].atMs <= 2000) {
-      current.push(lost[index]);
-    } else {
-      bursts.push(current);
-      current = [lost[index]];
-    }
-  }
-  bursts.push(current);
+// Describe observed consecutive loss runs without guessing their server-side
+// cause. Delivered trades split runs; quiet exchange gaps over two seconds do
+// too. Exchange timestamps prevent Kraken packet batching from inventing runs.
+function describeLossPattern(trades) {
+  const analysis = analyzeLossRuns(trades);
+  if (analysis.runs.length === 0) return "Загублених угод не було.";
 
-  const bigBursts = bursts.filter((burst) => burst.length >= 3);
-  if (bigBursts.length === 1) {
-    return `Втрати йшли пачкою з ${bigBursts[0].length} угод підряд — схоже на затик буфера на сервері.`;
-  }
-  if (bigBursts.length > 1) {
-    const sizes = bigBursts.map((burst) => burst.length).join(", ");
-    return `Втрати йшли пачками (розміри груп: ${sizes}) — схоже на затик буфера на сервері.`;
-  }
-  return "Втрати розкидані по всьому вікну поодинці — схоже на перевантажену розсилку, а не на затик буфера.";
+  const positionLabel = {
+    all: "протягом усього вікна",
+    start: "на початку вікна",
+    middle: "посередині вікна",
+    end: "наприкінці вікна",
+  };
+  const descriptions = analysis.runs.map((run) => {
+    const duration = run.durationMs > 0 ? ` за ${formatDelay(run.durationMs)}` : "";
+    return `${run.count} ${tradesWord(run.count)} ${positionLabel[run.position]}${duration}`;
+  });
+  return analysis.runs.length === 1
+    ? `Втрати утворили одну безперервну серію: ${descriptions[0]}.`
+    : `Серії втрат (${analysis.runs.length}): ${descriptions.join("; ")}.`;
 }
 
 function formatStatsMessage() {
@@ -1106,6 +1350,7 @@ function describeVerdictLine(probe) {
     default:
       if (probe.note === "kraken_disconnected") return "⚪ стан невідомий: Kraken розірвав з’єднання.";
       if (probe.note === "kraken_unavailable") return "⚪ стан невідомий: Kraken недоступний.";
+      if (probe.note === "kraken_parse_failure") return "⚪ стан невідомий: повідомлення Kraken не вдалося розібрати.";
       return "⚪ ринок був надто тихий, щоб оцінити (мало угод на біржі).";
   }
 }
@@ -1118,6 +1363,8 @@ function probeProblemSummary(entry) {
     case "feed_silent":
     case "no_matches":
       return "угоди не доходили";
+    case "invalid_feed_messages":
+      return "фід надсилав пошкоджені дані";
     case "missing_trades":
       return `губилися угоди (дійшло ${entry.coveragePct}%)`;
     case "slow_delivery":
@@ -1128,6 +1375,8 @@ function probeProblemSummary(entry) {
       return "Kraken розірвав з’єднання";
     case "kraken_unavailable":
       return "Kraken був недоступний";
+    case "kraken_parse_failure":
+      return "повідомлення Kraken не розібралося";
     case "quiet_market":
       return "тихий ринок";
     default:
@@ -1359,7 +1608,10 @@ async function handleApiRequest(request, response) {
         feedChannel: config.feedChannel,
         krakenSymbol: config.krakenSymbol,
         probeIntervalMinutes: Math.round(config.probeIntervalMs / 60_000),
+        probeWarmupSeconds: Math.round(config.probeWarmupMs / 1000),
+        probePreRollSeconds: Math.round(config.probePreRollMs / 1000),
         probeWindowSeconds: Math.round(config.probeWindowMs / 1000),
+        probeDrainSeconds: Math.round(config.probeDrainMs / 1000),
         slowDelayMs: thresholds.slowDelayMs,
       },
     });

@@ -19,9 +19,11 @@ A first `down`/`degraded` probe is re-checked once after `CONFIRM_DELAY_SECONDS`
 
 If the Kraken reference is unavailable or disconnects, the bot records the reason and retries once after `CONFIRM_DELAY_SECONDS`. If the retry also fails, it warns the chat outside quiet hours that BitcoinTicker could not be checked; it never labels the app feed `down` from an incomplete reference.
 
-Outside quiet hours, every `down`/`degraded` result sends a notification. An `ok` result sends a notification only when the last notified state was a problem (broke → recovered). Every Kraken trade must have a one-to-one price + quantity match from the app feed; feed timestamps are not used because they have one-second resolution.
+Outside quiet hours, every `down`/`degraded` result sends a notification. An `ok` result sends a notification only when the last notified state was a problem (broke → recovered). Every Kraken trade must have a one-to-one app-feed match by rounded exchange second + price + quantity + side. Within each exact class a maximum-cardinality, minimum-time-distance matcher assigns copies globally.
 
-The comparison has explicit boundaries: the app feed is subscribed first and warmed for 3 seconds, Kraken must acknowledge its subscription, then both live subscriptions stabilize for another 3 seconds before both buffers start empty at the same instant. After the 90-second reference window only the app feed remains open for a 10-second delivery drain. With startup and end races removed, even one Kraken trade is enough for a verdict; zero trades means there was nothing to test.
+The comparison has explicit monotonic-clock boundaries: the app feed is subscribed first and warmed for 3 seconds, Kraken must acknowledge its subscription, then both active subscriptions are recorded for another 3-second overlapping sync. Nothing is cleared at the measurement boundary. A 2-second feed pre-roll protects copies that beat this process's direct Kraken socket. Both sockets remain recorded through the 10-second drain; sync and post-window Kraken trades are matching context only and never enter the verdict. This prevents equal-value trades outside the reference window from backfilling an in-window loss.
+
+Exchange timestamps and local receive timestamps are stored separately. Relative delivery delay remains `feed receive − direct Kraken receive`, measured on a monotonic clock; its signed value is retained so genuine feed leads are visible. Raw message counts, parse failures, first-message/trade activation timings, all parsed feed trades, and overlapping-sync coverage are recorded for diagnosis.
 
 ## Quiet hours
 
@@ -34,7 +36,7 @@ Restricted to `TELEGRAM_CHAT_ID` (this bot lives in its own group, separate from
 - `/stats` — current state of the feed, last probe, whether quiet hours are active, uptime.
 - `/day` — the last 24 hours as a list: one line per probe with its persistent number (`№47 19:42 🟠 губилися угоди (дійшло 78%)`), plus totals and typical/worst delay.
 - `/check` — run a probe right now and reply with the result (normally under two minutes including setup and delivery drain). While any probe is running, repeated `/check` commands are not processed: the first duplicate gets a short "already running" notice, the rest are dropped, and the scheduled hourly probe also never overlaps a manual one.
-- `/details` — full breakdown of the last probe: counts, delays, handshake time, and the list of lost trades (exchange-side time, price × quantity, up to 20 shown / 30 stored) with a burst-vs-scattered pattern hint for debugging the feed server. `/details 47` (also `№47`) shows the same for any probe number from `/day`; probe numbers are permanent.
+- `/details` — full breakdown of the last probe: counts, delays, handshake/activation time, overlapping-sync coverage, parse failures, and every reference trade with exchange-side time, price, quantity, side, and delivery status. Loss runs are described from the full ordered stream, so a delivered trade breaks a run and Kraken packet batching cannot invent one. `/details 47` (also `№47`) shows the same for a recorded probe number.
 
 ## Read-only HTTP API
 
@@ -45,8 +47,8 @@ Authenticate with `Authorization: Bearer $API_TOKEN` or `?token=$API_TOKEN`.
 - `GET /health` — no auth, for Railway's healthcheck: uptime plus the last probe's time and verdict.
 - `GET /api/stats` — current state, quiet hours, next probe, verdict totals over all history, last probe.
 - `GET /api/probes?hours=24&limit=100&verdict=degraded,down` — probe rows, newest first. `since=<ISO>` instead of `hours`; `verdict` takes a comma-separated list.
-- `GET /api/probes/<№>` — one probe with all its trades (delivered and lost). Same numbering as `/day` and `/details`.
-- `GET /api/sql?q=SELECT...` (or the query as a POST body) — any single `SELECT`/`WITH` over `probes`, `trades`, `kv`. Anything else is rejected, and at most 5000 rows come back.
+- `GET /api/probes/<№>` — one probe with measurement, sync and drain Kraken context plus every parsed feed trade, including unmatched records and their collection phase. Same numbering as `/day` and `/details`.
+- `GET /api/sql?q=SELECT...` (or the query as a POST body) — any single `SELECT`/`WITH` over `probes`, `trades`, `feed_trades`, `message_events`, or `kv`. Anything else is rejected, and at most 5000 rows come back.
 
 ```sh
 curl -s -H "Authorization: Bearer $API_TOKEN" \
@@ -86,13 +88,15 @@ No dependencies — the bot uses Node's built-in `WebSocket`, `fetch`, and `node
 
 ## Storage
 
-SQLite via Node's built-in `node:sqlite` (needs Node ≥ 22.13; still zero npm dependencies). The database `heartbeat.db` has three tables:
+SQLite via Node's built-in `node:sqlite` (needs Node ≥ 22.13; still zero npm dependencies). The database `heartbeat.db` has five tables:
 
-- `probes` — one row per probe; the row id is the permanent probe number shown in `/day` and accepted by `/details`.
-- `trades` — every reference trade with its delivered/lost status, linked to its probe.
+- `probes` — one row per probe with verdict and connection/activation/parser/sync telemetry.
+- `trades` — measurement reference trades plus sync/drain Kraken context, with exchange and receive times and the selected feed copy.
+- `feed_trades` — every successfully parsed feed trade, including unmatched warmup and drain records.
+- `message_events` — every feed/Kraken WebSocket message with source, phase, receive time, parsed-trade count and parse failures; a short raw preview is retained only for malformed messages.
 - `kv` — service state: Telegram update offset, last notified verdict, first-run marker.
 
-History is never trimmed, so long-term patterns (which hours degrade, whether it worsens over weeks) stay queryable with plain SQL. On first run the bot imports an existing pre-SQLite `heartbeat_state.json` (preserving probe numbers) and renames it to `.imported`.
+This is an internal diagnostic bot and its early history is disposable. A schema-version change recreates `probes`, `trades`, `feed_trades`, and `message_events` instead of running migrations; `kv` survives so Telegram updates are not replayed. Within one schema version history remains queryable with plain SQL.
 
 For Railway, mount a volume; if `STATE_DIR` is not set, the bot automatically uses Railway's `RAILWAY_VOLUME_MOUNT_PATH`. `DB_FILE` overrides the exact path.
 

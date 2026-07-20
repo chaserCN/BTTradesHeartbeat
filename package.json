@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node bot.mjs",
     "once": "RUN_ONCE=true node bot.mjs",
-    "dry": "RUN_ONCE=true DRY_RUN=true node bot.mjs"
+    "dry": "RUN_ONCE=true DRY_RUN=true node bot.mjs",
+    "test": "node --test"
   },
   "engines": {
     "node": ">=22.13"
