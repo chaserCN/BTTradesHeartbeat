@@ -9,6 +9,14 @@ import { isKrakenReferenceFailure, runScheduledProbeSequence } from "./heartbeat
 import { formatDetailsMessages } from "./heartbeat-format.mjs";
 import { collectSession, computeSessionMetrics } from "./heartbeat-session.mjs";
 import { createHeartbeatStore } from "./heartbeat-storage.mjs";
+import {
+  agreeUkCount,
+  CHECK_NOMINATIVE_FORMS,
+  formatUkCount,
+  MESSAGE_ACCUSATIVE_FORMS,
+  TRADE_ACCUSATIVE_FORMS,
+  TRADE_NOMINATIVE_FORMS,
+} from "./ukrainian.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -354,7 +362,9 @@ function formatVerdictChangeMessage(probe, previousVerdict) {
   }
 
   const recoveryDetail = probe.matched > 0 && probe.delayMedianMs !== null
-    ? `Дійшли всі ${probe.matched} ${tradesWord(probe.matched)}, угоди долітали за ${formatDelay(probe.delayMedianMs)}.`
+    ? `${agreeUkCount(probe.matched, "Дійшла", "Дійшли всі")} ` +
+      `${formatUkCount(probe.matched, TRADE_NOMINATIVE_FORMS)}, ` +
+      `${agreeUkCount(probe.matched, "угода долітала", "угоди долітали")} за ${formatDelay(probe.delayMedianMs)}.`
     : "Угоди знову доходять без затримок.";
   return [
     "🟢 <b>Стрічка угод знову працює нормально</b>",
@@ -385,7 +395,7 @@ function formatManualCheckMessage(probe) {
   if (probe.verdict === "ok") {
     const total = referenceCount(probe);
     lines.push(
-      `Біржа показала ${total} ${tradesWord(total)}, наш сервер передав ${probe.coveragePct}% з них. ` +
+      `Біржа показала ${formatUkCount(total, TRADE_ACCUSATIVE_FORMS)}, наш сервер передав ${probe.coveragePct}% з них. ` +
         `Зазвичай угода долітала за ${formatDelay(probe.delayMedianMs)}, найповільніша — за ${formatDelay(probe.delayMaxMs)}.`,
     );
   } else {
@@ -419,14 +429,21 @@ function describeProblemDetail(probe) {
     case "feed_silent":
     case "no_matches":
       return probe.ourTrades > 0
-        ? `Біржа показала ${probe.krakenTrades} ${tradesWord(probe.krakenTrades)}, сервер надіслав ${probe.ourTrades} повідомлень, але реальних угод з біржі серед них немає — дані не збігаються.`
-        : `Біржа показала ${probe.krakenTrades} ${tradesWord(probe.krakenTrades)} за ${probe.windowSeconds} с, наш сервер не передав жодної.`;
+        ? `Біржа показала ${formatUkCount(probe.krakenTrades, TRADE_ACCUSATIVE_FORMS)}, ` +
+          `сервер надіслав ${formatUkCount(probe.ourTrades, MESSAGE_ACCUSATIVE_FORMS)}, ` +
+          "але реальних угод з біржі серед них немає — дані не збігаються."
+        : `Біржа показала ${formatUkCount(probe.krakenTrades, TRADE_ACCUSATIVE_FORMS)} ` +
+          `за ${probe.windowSeconds} с, наш сервер не передав жодної.`;
     case "invalid_feed_messages":
-      return `Фід надіслав ${probe.measurementFeedMessages} повідомлень, але ${probe.measurementFeedParseFailures} з них не вдалося розібрати. Дані фіда пошкоджені або змінили формат.`;
+      return `Фід надіслав ${formatUkCount(probe.measurementFeedMessages, MESSAGE_ACCUSATIVE_FORMS)}, ` +
+        `але ${probe.measurementFeedParseFailures} з них не вдалося розібрати. ` +
+        "Дані фіда пошкоджені або змінили формат.";
     case "socket_dropped":
-      return `Сервер обривав з'єднання під час перевірки. Дійшло ${probe.matched} з ${total} угод (${probe.coveragePct}%).`;
+      return `Сервер обривав з'єднання під час перевірки. ` +
+        `Дійшло: ${probe.matched} із ${total} (${probe.coveragePct}%).`;
     case "missing_trades":
-      return `Частина угод губиться: з ${total} угод на біржі дійшло лише ${probe.matched} (${probe.coveragePct}%). Ті, що дійшли, долітали зазвичай за ${formatDelay(probe.delayMedianMs)}.`;
+      return `Частина угод губиться. Дійшло: ${probe.matched} із ${total} (${probe.coveragePct}%). ` +
+        `Ті, що дійшли, долітали зазвичай за ${formatDelay(probe.delayMedianMs)}.`;
     case "slow_delivery":
       return `Угоди доходять (${probe.coveragePct}%), але повільно: зазвичай за ${formatDelay(probe.delayMedianMs)}, найповільніші — за ${formatDelay(probe.delaySlowMs)}. У нормі — менш ніж пів секунди.`;
     default:
@@ -449,7 +466,7 @@ function formatStatsMessage() {
     if (probe.verdict === "ok" && probe.delayMedianMs !== null) {
       const total = referenceCount(probe);
       lines.push(
-        `Біржа показала ${total} ${tradesWord(total)}, наш сервер передав ${probe.coveragePct}% з них. ` +
+        `Біржа показала ${formatUkCount(total, TRADE_ACCUSATIVE_FORMS)}, наш сервер передав ${probe.coveragePct}% з них. ` +
           `Зазвичай угода долітає за ${formatDelay(probe.delayMedianMs)}.`,
       );
     } else if (probe.verdict === "degraded" || probe.verdict === "down") {
@@ -494,10 +511,21 @@ function formatDayMessage() {
     const quietChecks = entries.filter((entry) => entry.note === "quiet_market").length;
     const krakenFailures = entries.filter((entry) => isKrakenReferenceFailure(entry)).length;
     const notes = [];
-    if (quietChecks > 0) notes.push(`${quietChecks} ${checksWord(quietChecks)} припали на тихий ринок.`);
-    if (krakenFailures > 0) notes.push(`${krakenFailures} ${checksWord(krakenFailures)} не дали результату через Kraken.`);
+    if (quietChecks > 0) {
+      notes.push(
+        `${formatUkCount(quietChecks, CHECK_NOMINATIVE_FORMS)} ` +
+          `${agreeUkCount(quietChecks, "припала", "припали")} на тихий ринок.`,
+      );
+    }
+    if (krakenFailures > 0) {
+      notes.push(
+        `${formatUkCount(krakenFailures, CHECK_NOMINATIVE_FORMS)} ` +
+          `${agreeUkCount(krakenFailures, "не дала", "не дали")} результату через Kraken.`,
+      );
+    }
     const headline = byVerdict.ok > 0
-      ? `🟢 Проблем не було: сервер працював нормально всі ${byVerdict.ok} ${checksWord(byVerdict.ok)}.`
+      ? `🟢 Проблем не було: ${formatUkCount(byVerdict.ok, CHECK_NOMINATIVE_FORMS)} ` +
+        `${agreeUkCount(byVerdict.ok, "минула", "минули")} успішно.`
       : "⚪ Стан сервера за цей період підтвердити не вдалося.";
     lines.push([headline, ...notes].join(" "));
   } else {
@@ -509,7 +537,7 @@ function formatDayMessage() {
   lines.push("");
   const shown = entries.slice(-48);
   if (shown.length < entries.length) {
-    lines.push(`(показані останні ${shown.length} перевірок)`);
+    lines.push(`(показано лише ${shown.length} із ${entries.length})`);
   }
   for (const entry of shown) {
     let line = `№${entry.id} ${formatTimeShort(Date.parse(entry.at))} ${verdictEmoji(entry.verdict)}`;
@@ -609,22 +637,6 @@ function formatDelay(ms) {
   if (ms < 1000) return `${(ms / 1000).toFixed(2).replace(".", ",")} с`;
   if (ms < 10_000) return `${(ms / 1000).toFixed(1).replace(".", ",")} с`;
   return `${Math.round(ms / 1000)} с`;
-}
-
-function checksWord(count) {
-  const mod10 = count % 10;
-  const mod100 = count % 100;
-  if (mod10 === 1 && mod100 !== 11) return "перевірку";
-  if (mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14)) return "перевірки";
-  return "перевірок";
-}
-
-function tradesWord(count) {
-  const mod10 = count % 10;
-  const mod100 = count % 100;
-  if (mod10 === 1 && mod100 !== 11) return "угоду";
-  if (mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14)) return "угоди";
-  return "угод";
 }
 
 // --- telegram --------------------------------------------------------------

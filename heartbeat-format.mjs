@@ -1,4 +1,5 @@
 import { analyzeLossRuns } from "./heartbeat-core.mjs";
+import { formatUkCount, TRADE_NOMINATIVE_FORMS } from "./ukrainian.mjs";
 
 export const TELEGRAM_MESSAGE_LIMIT = 4_096;
 
@@ -149,7 +150,7 @@ function describeLossPattern(trades) {
   };
   const descriptions = analysis.runs.map((run) => {
     const duration = run.durationMs > 0 ? ` за ${formatDelay(run.durationMs)}` : "";
-    return `${run.count} ${tradesWord(run.count)} ${positionLabel[run.position]}${duration}`;
+    return `${formatUkCount(run.count, TRADE_NOMINATIVE_FORMS)} ${positionLabel[run.position]}${duration}`;
   });
   return analysis.runs.length === 1
     ? `Втрати утворили одну безперервну серію: ${descriptions[0]}.`
@@ -191,14 +192,6 @@ function formatDelay(ms) {
   if (ms < 1000) return `${(ms / 1000).toFixed(2).replace(".", ",")} с`;
   if (ms < 10_000) return `${(ms / 1000).toFixed(1).replace(".", ",")} с`;
   return `${Math.round(ms / 1000)} с`;
-}
-
-function tradesWord(count) {
-  const mod10 = count % 10;
-  const mod100 = count % 100;
-  if (mod10 === 1 && mod100 !== 11) return "угоду";
-  if (mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14)) return "угоди";
-  return "угод";
 }
 
 function formatTimeWithSeconds(ms, timeZone) {

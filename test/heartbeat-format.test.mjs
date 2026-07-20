@@ -85,6 +85,39 @@ test("details hide subscription and overlapping-warmup telemetry", () => {
   assert.match(output, /Загублених угод не було/);
 });
 
+// Intent: the loss summary is a nominative counted list, so a single loss
+// must read "1 угода" rather than the accusative "1 угоду".
+test("a single loss uses the nominative Ukrainian form", () => {
+  const base = Date.parse("2026-07-20T09:05:00Z");
+  const trades = [
+    { exchangeAtMs: base, receivedAtMs: base + 30, price: 60_000, quantity: 0.001, side: "buy", delivered: true },
+    { exchangeAtMs: base + 1_000, receivedAtMs: base + 1_030, price: 60_001, quantity: 0.002, side: "sell", delivered: false },
+    { exchangeAtMs: base + 2_000, receivedAtMs: base + 2_030, price: 60_002, quantity: 0.003, side: "buy", delivered: true },
+  ];
+  const output = formatDetailsMessages({
+    id: 9,
+    at: "2026-07-20T09:05:00Z",
+    verdict: "degraded",
+    note: "missing_trades",
+    windowSeconds: 90,
+    referenceTrades: 3,
+    matched: 2,
+    coveragePct: 67,
+    delayMedianMs: 30,
+    delayMaxMs: 30,
+    handshakeMs: 10,
+    measurementFeedParseFailures: 0,
+    measurementKrakenParseFailures: 0,
+    feedCloses: 0,
+    feedErrors: 0,
+    trades,
+    lostTrades: [trades[1]],
+  }, { timeZone: "UTC" }).join("\n");
+
+  assert.match(output, /1 угода посередині вікна/);
+  assert.doesNotMatch(output, /1 угоду/);
+});
+
 test("every verdict detail variant is bounded and contains no missing placeholders", () => {
   const variants = [
     ["ok", ""],
