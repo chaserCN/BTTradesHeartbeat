@@ -84,6 +84,17 @@ Run continuously:
 npm start
 ```
 
+Run the deterministic edge/integration suite:
+
+```sh
+npm test
+```
+
+It attacks matching boundaries and duplicate bursts, the complete socket phase
+lifecycle with fake monotonic time, partial parser failures, atomic SQLite
+rollback/schema reset, authenticated API round-trips, and Telegram's 4096
+character limit. No live network or secrets are needed for the tests.
+
 No dependencies — the bot uses Node's built-in `WebSocket`, `fetch`, and `node:sqlite` (Node ≥ 22.13).
 
 ## Storage

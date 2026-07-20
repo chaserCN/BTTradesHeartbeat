@@ -83,6 +83,27 @@ test("malformed feed messages are counted instead of disappearing", () => {
   );
 });
 
+test("a mixed Kraken packet retains valid trades and counts each invalid item", () => {
+  const parsed = parseKrakenMessage(JSON.stringify({
+    channel: "trade",
+    type: "update",
+    data: [
+      {
+        timestamp: "2026-07-20T09:05:22.194771Z",
+        price: 63_977.5,
+        qty: 0.00078153,
+        side: "sell",
+        trade_id: 1,
+      },
+      { timestamp: "invalid", price: 63_977.5, qty: 0.00078153, side: "sell" },
+      { timestamp: "2026-07-20T09:05:22Z", price: 63_977.5, qty: 0.00078153, side: "hold" },
+    ],
+  }), 20_000, 2_000);
+  assert.equal(parsed.trades.length, 1);
+  assert.equal(parsed.trades[0].tradeId, "1");
+  assert.equal(parsed.parseFailures, 2);
+});
+
 test("the real value grain stays outside the former numeric tolerance", () => {
   const reference = krakenTrade();
   assert.notEqual(tradeMatchKey(reference), tradeMatchKey({ ...reference, price: reference.price + 0.1 }));
@@ -218,6 +239,24 @@ test("global matcher agrees with brute force on randomized small classes", () =>
       `iteration ${iteration}`,
     );
   }
+});
+
+// Intent: a burst of equal-value trades must conserve one-to-one cardinality
+// and choose the globally nearest copies instead of collapsing duplicates.
+test("matcher handles two hundred identical trades without reuse or loss", () => {
+  const count = 200;
+  const references = Array.from({ length: count }, (_, index) =>
+    krakenTrade({ tradeId: String(index), receivedMonoMs: index * 10 }));
+  const feeds = Array.from({ length: count }, (_, index) =>
+    feedTrade({ sequence: index + 1, receivedMonoMs: (count - index - 1) * 10 + 3 }));
+  const metrics = computeTradeMetrics(references, feeds, { maxLeadMs: 3_000, maxLagMs: 3_000 });
+  const sequences = metrics.allTrades.map((trade) => trade.matchedFeedSequence);
+  assert.equal(metrics.matched, count);
+  assert.equal(new Set(sequences).size, count);
+  assert.equal(
+    metrics.allTrades.reduce((sum, trade) => sum + Math.abs(trade.signedDelayMs), 0),
+    count * 3,
+  );
 });
 
 test("delivered trades split loss runs even when timestamps are close", () => {

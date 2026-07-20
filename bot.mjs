@@ -1,18 +1,13 @@
-import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
-import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 
-import {
-  analyzeLossRuns,
-  computeTradeMetrics,
-  judgeProbe,
-  parseFeedTrade,
-  parseKrakenMessage,
-  summarizeTradeResults,
-} from "./heartbeat-core.mjs";
+import { judgeProbe } from "./heartbeat-core.mjs";
+import { createApiHandler, sendJson } from "./heartbeat-api.mjs";
+import { formatDetailsMessages } from "./heartbeat-format.mjs";
+import { collectSession, computeSessionMetrics } from "./heartbeat-session.mjs";
+import { createHeartbeatStore } from "./heartbeat-storage.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -57,119 +52,16 @@ const thresholds = {
 const expectedProbeDurationMs =
   (2 * config.probeWarmupMs) + (2 * config.connectTimeoutMs) + config.probeWindowMs + config.probeDrainMs;
 
-// Storage: SQLite (built into Node, no dependencies). This is a young internal
-// diagnostic bot, so probe history is disposable: incompatible schemas reset
-// the measurement tables instead of carrying migration code. Service kv state
-// survives the reset so Telegram offsets are not replayed.
-const SCHEMA_VERSION = 6;
-const db = new DatabaseSync(config.dbFile);
-db.exec("PRAGMA journal_mode = WAL;");
-const schemaVersion = db.prepare("PRAGMA user_version").get().user_version;
-if (schemaVersion !== SCHEMA_VERSION) {
-  db.exec(`
-    DROP TABLE IF EXISTS message_events;
-    DROP TABLE IF EXISTS feed_trades;
-    DROP TABLE IF EXISTS trades;
-    DROP TABLE IF EXISTS probes;
-  `);
-}
-db.exec(`
-  CREATE TABLE IF NOT EXISTS probes (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    at TEXT NOT NULL,
-    measurement_started_at TEXT,
-    measurement_started_mono_ms REAL,
-    verdict TEXT NOT NULL,
-    note TEXT,
-    window_seconds INTEGER,
-    handshake_ms INTEGER,
-    subscribe_to_first_message_ms INTEGER,
-    subscribe_to_first_trade_ms INTEGER,
-    feed_messages INTEGER,
-    feed_parse_failures INTEGER,
-    measurement_feed_messages INTEGER,
-    measurement_feed_parse_failures INTEGER,
-    feed_parsed_trades INTEGER,
-    feed_warmup_trades INTEGER,
-    feed_sync_trades INTEGER,
-    kraken_messages INTEGER,
-    kraken_parse_failures INTEGER,
-    measurement_kraken_parse_failures INTEGER,
-    kraken_sync_trades INTEGER,
-    sync_matched INTEGER,
-    sync_coverage_pct INTEGER,
-    kraken_trades INTEGER,
-    our_trades INTEGER,
-    reference_trades INTEGER,
-    matched INTEGER,
-    coverage_pct INTEGER,
-    delay_median_ms INTEGER,
-    delay_slow_ms INTEGER,
-    delay_max_ms INTEGER,
-    signed_delay_min_ms INTEGER,
-    signed_delay_median_ms INTEGER,
-    feed_closes INTEGER,
-    feed_errors INTEGER
-  );
-  CREATE INDEX IF NOT EXISTS idx_probes_at ON probes(at);
-  CREATE TABLE IF NOT EXISTS trades (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    probe_id INTEGER NOT NULL REFERENCES probes(id),
-    scope TEXT NOT NULL,
-    exchange_at_ms REAL NOT NULL,
-    kraken_received_at_ms INTEGER NOT NULL,
-    kraken_received_mono_ms REAL NOT NULL,
-    price REAL NOT NULL,
-    quantity REAL NOT NULL,
-    side TEXT NOT NULL,
-    kraken_trade_id TEXT,
-    delivered INTEGER NOT NULL DEFAULT 0,
-    feed_received_at_ms INTEGER,
-    signed_delay_ms INTEGER,
-    delay_ms INTEGER,
-    matched_feed_sequence INTEGER
-  );
-  CREATE INDEX IF NOT EXISTS idx_trades_probe ON trades(probe_id, scope);
-  CREATE TABLE IF NOT EXISTS feed_trades (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    probe_id INTEGER NOT NULL REFERENCES probes(id),
-    sequence INTEGER NOT NULL,
-    phase TEXT NOT NULL,
-    exchange_at_ms REAL NOT NULL,
-    received_at_ms INTEGER NOT NULL,
-    received_mono_ms REAL NOT NULL,
-    price REAL NOT NULL,
-    quantity REAL NOT NULL,
-    side TEXT NOT NULL,
-    matched_scope TEXT,
-    UNIQUE(probe_id, sequence)
-  );
-  CREATE INDEX IF NOT EXISTS idx_feed_trades_probe ON feed_trades(probe_id, phase);
-  CREATE TABLE IF NOT EXISTS message_events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    probe_id INTEGER NOT NULL REFERENCES probes(id),
-    source TEXT NOT NULL,
-    sequence INTEGER NOT NULL,
-    phase TEXT NOT NULL,
-    received_at_ms INTEGER NOT NULL,
-    received_mono_ms REAL NOT NULL,
-    parsed_trades INTEGER NOT NULL,
-    parse_failures INTEGER NOT NULL,
-    raw_preview TEXT,
-    UNIQUE(probe_id, source, sequence)
-  );
-  CREATE INDEX IF NOT EXISTS idx_message_events_probe ON message_events(probe_id, source, phase);
-  CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT);
-  PRAGMA user_version = ${SCHEMA_VERSION};
-`);
-
-// A second, read-only connection to the same file, used only by the HTTP API.
-// Declared here rather than in the API section because the server starts
-// before the top-level `await heartbeatCycle()` below, and anything declared
-// after that await is still in its temporal dead zone while the first probe
-// runs — an early request would throw.
-const SQL_ROW_LIMIT = 5_000;
-let readOnlyDb = null;
+const store = createHeartbeatStore(config.dbFile);
+const {
+  getLastProbe,
+  getProbeById,
+  getProbesSince,
+  kvGet,
+  kvSet,
+  recordProbe,
+  withTrades,
+} = store;
 
 const startedAt = new Date();
 
@@ -312,8 +204,20 @@ async function runManualCheck(chatId) {
 // alone — Kraken's own stream is the reference that tells them apart.
 async function runProbe() {
   const startedAtMs = Date.now();
-  const session = await collectSession(config.probeWindowMs, config.probeWarmupMs, config.probeDrainMs);
-  const metrics = computeMetrics(session);
+  const session = await collectSession({
+    windowMs: config.probeWindowMs,
+    warmupMs: config.probeWarmupMs,
+    drainMs: config.probeDrainMs,
+    connectTimeoutMs: config.connectTimeoutMs,
+    feedUrl: config.feedUrl,
+    feedChannel: config.feedChannel,
+    krakenUrl: config.krakenUrl,
+    krakenSymbol: config.krakenSymbol,
+  });
+  const metrics = computeSessionMetrics(session, {
+    preRollMs: config.probePreRollMs,
+    drainMs: config.probeDrainMs,
+  });
   const verdict = judgeProbe(session, metrics, thresholds.slowDelayMs);
   const measurementStartedAt = session.measurementStartedAtMs === null
     ? null
@@ -399,551 +303,6 @@ async function runProbe() {
     lostTrades: probe.lostTrades.length,
   })}`);
   return probe;
-}
-
-function collectSession(windowMs, warmupMs, drainMs) {
-  return new Promise((resolve) => {
-    const session = {
-      windowMs: 0,
-      measurementStartedAtMs: null,
-      measurementStartedMonoMs: null,
-      referenceEndedAtMs: null,
-      referenceEndedMonoMs: null,
-      endedAtMs: null,
-      endedAtMonoMs: null,
-      syncStartedAtMs: null,
-      syncStartedMonoMs: null,
-      feed: {
-        handshakeMs: null,
-        connectFailed: false,
-        trades: [],
-        closes: 0,
-        errors: 0,
-        messages: 0,
-        parseFailures: 0,
-        events: [],
-        subscribedAtMs: null,
-        subscribedAtMonoMs: null,
-        subscribeToFirstMessageMs: null,
-        subscribeToFirstTradeMs: null,
-      },
-      kraken: {
-        connected: false,
-        connectFailed: false,
-        disconnected: false,
-        trades: [],
-        messages: 0,
-        parseFailures: 0,
-        events: [],
-      },
-    };
-
-    const connectionStartedAtMs = Date.now();
-    let finished = false;
-    let phase = "connecting_feed";
-    let feedSocket = null;
-    let krakenSocket = null;
-    let feedConnectTimer = null;
-    let warmupTimer = null;
-    let krakenConnectTimer = null;
-    let syncTimer = null;
-    let measurementTimer = null;
-    let drainTimer = null;
-
-    const finish = () => {
-      if (finished) return;
-      finished = true;
-      phase = "finished";
-      for (const timer of [feedConnectTimer, warmupTimer, krakenConnectTimer, syncTimer, measurementTimer, drainTimer]) {
-        if (timer) clearTimeout(timer);
-      }
-      session.endedAtMs = Date.now();
-      session.endedAtMonoMs = performance.now();
-      if (session.measurementStartedMonoMs !== null) {
-        session.windowMs =
-          (session.referenceEndedMonoMs ?? session.endedAtMonoMs) - session.measurementStartedMonoMs;
-      }
-      for (const socket of [feedSocket, krakenSocket]) {
-        try { socket?.close(); } catch { /* already closed */ }
-      }
-      resolve(session);
-    };
-
-    const beginMeasurement = () => {
-      if (finished || phase !== "syncing") return;
-
-      // Keep the overlapping sync history. Exact monotonic boundaries select
-      // the measurement reference later; the feed pre-roll remains available
-      // for copies that reached this process before Kraken did.
-      session.measurementStartedAtMs = Date.now();
-      session.measurementStartedMonoMs = performance.now();
-      phase = "measuring";
-
-      measurementTimer = setTimeout(() => {
-        if (finished || phase !== "measuring") return;
-        session.referenceEndedAtMs = Date.now();
-        session.referenceEndedMonoMs = performance.now();
-        phase = "draining";
-
-        // The reference window is fixed, but keep Kraken open during drain as
-        // non-verdict context. Post-window Kraken trades reserve their own feed
-        // copies so an equal-value new trade cannot backfill an in-window loss.
-        drainTimer = setTimeout(finish, drainMs);
-      }, windowMs);
-    };
-
-    const connectKraken = () => {
-      if (finished) return;
-      phase = "connecting_kraken";
-
-      try {
-        krakenSocket = new WebSocket(config.krakenUrl);
-      } catch {
-        session.kraken.connectFailed = true;
-        finish();
-        return;
-      }
-
-      // This timeout includes both the WebSocket handshake and Kraken's
-      // subscription acknowledgement.
-      krakenConnectTimer = setTimeout(() => {
-        if (phase === "connecting_kraken") {
-          session.kraken.connectFailed = true;
-          finish();
-        }
-      }, config.connectTimeoutMs);
-
-      krakenSocket.onopen = () => {
-        session.kraken.connected = true;
-        krakenSocket.send(
-          JSON.stringify({ method: "subscribe", params: { channel: "trade", symbol: [config.krakenSymbol], snapshot: false } }),
-        );
-      };
-      krakenSocket.onmessage = (event) => {
-        if (finished) return;
-        const receivedAtMs = Date.now();
-        const receivedMonoMs = performance.now();
-        session.kraken.messages += 1;
-        const message = parseKrakenMessage(event.data, receivedAtMs, receivedMonoMs);
-        session.kraken.parseFailures += message.parseFailures;
-        session.kraken.events.push({
-          sequence: session.kraken.messages,
-          phase,
-          receivedAtMs,
-          receivedMonoMs,
-          parsedTrades: message.trades.length,
-          parseFailures: message.parseFailures,
-          rawPreview: message.parseFailures > 0 ? previewRawMessage(event.data) : null,
-        });
-        if (message.subscription === "accepted" && phase === "connecting_kraken") {
-          clearTimeout(krakenConnectTimer);
-          session.syncStartedAtMs = receivedAtMs;
-          session.syncStartedMonoMs = receivedMonoMs;
-          phase = "syncing";
-          syncTimer = setTimeout(beginMeasurement, warmupMs);
-          return;
-        }
-        if (message.subscription === "rejected") {
-          session.kraken.connectFailed = true;
-          console.error(`Kraken subscription failed: ${message.error || "unknown error"}`);
-          finish();
-          return;
-        }
-        if (phase === "syncing" || phase === "measuring" || phase === "draining") {
-          session.kraken.trades.push(...message.trades.map((trade) => ({ ...trade, phase })));
-        }
-      };
-      krakenSocket.onerror = () => {
-        if (phase === "connecting_kraken") {
-          session.kraken.connectFailed = true;
-          finish();
-        } else if (phase === "syncing" || phase === "measuring") {
-          session.kraken.disconnected = true;
-          finish();
-        }
-      };
-      krakenSocket.onclose = () => {
-        if (finished || phase === "draining") return;
-        if (phase === "connecting_kraken") {
-          session.kraken.connectFailed = true;
-        } else if (phase === "syncing" || phase === "measuring") {
-          session.kraken.disconnected = true;
-        }
-        finish();
-      };
-    };
-
-    try {
-      feedSocket = new WebSocket(config.feedUrl);
-    } catch {
-      session.feed.connectFailed = true;
-      finish();
-      return;
-    }
-
-    feedConnectTimer = setTimeout(() => {
-      if (session.feed.handshakeMs === null) {
-        session.feed.connectFailed = true;
-        finish();
-      }
-    }, config.connectTimeoutMs);
-
-    feedSocket.onopen = () => {
-      clearTimeout(feedConnectTimer);
-      session.feed.handshakeMs = Date.now() - connectionStartedAtMs;
-      session.feed.subscribedAtMs = Date.now();
-      session.feed.subscribedAtMonoMs = performance.now();
-      feedSocket.send(JSON.stringify({ subscribe: config.feedChannel }));
-      phase = "warming_feed";
-      warmupTimer = setTimeout(connectKraken, warmupMs);
-    };
-    feedSocket.onmessage = (event) => {
-      if (finished) return;
-      const receivedAtMs = Date.now();
-      const receivedMonoMs = performance.now();
-      session.feed.messages += 1;
-      if (session.feed.subscribeToFirstMessageMs === null && session.feed.subscribedAtMonoMs !== null) {
-        session.feed.subscribeToFirstMessageMs = Math.round(receivedMonoMs - session.feed.subscribedAtMonoMs);
-      }
-      const parsed = parseFeedTrade(event.data, receivedAtMs, receivedMonoMs);
-      session.feed.parseFailures += parsed.parseFailures;
-      session.feed.events.push({
-        sequence: session.feed.messages,
-        phase,
-        receivedAtMs,
-        receivedMonoMs,
-        parsedTrades: parsed.trade ? 1 : 0,
-        parseFailures: parsed.parseFailures,
-        rawPreview: parsed.parseFailures > 0 ? previewRawMessage(event.data) : null,
-      });
-      if (parsed.trade) {
-        if (session.feed.subscribeToFirstTradeMs === null && session.feed.subscribedAtMonoMs !== null) {
-          session.feed.subscribeToFirstTradeMs = Math.round(receivedMonoMs - session.feed.subscribedAtMonoMs);
-        }
-        session.feed.trades.push({
-          ...parsed.trade,
-          phase,
-          sequence: session.feed.messages,
-        });
-      }
-    };
-    feedSocket.onerror = () => {
-      session.feed.errors += 1;
-      if (phase === "connecting_feed" || phase === "warming_feed" || phase === "connecting_kraken" || phase === "syncing") {
-        session.feed.connectFailed = true;
-        finish();
-      }
-    };
-    feedSocket.onclose = () => {
-      if (finished) return;
-      session.feed.closes += 1;
-      if (phase === "connecting_feed" || phase === "warming_feed" || phase === "connecting_kraken" || phase === "syncing") {
-        session.feed.connectFailed = true;
-        finish();
-      }
-    };
-  });
-}
-
-function computeMetrics(session) {
-  if (session.measurementStartedMonoMs === null) {
-    return {
-      ...computeTradeMetrics([], []),
-      feedCandidates: [],
-      sync: computeTradeMetrics([], []),
-      drain: computeTradeMetrics([], []),
-      feedMessages: 0,
-      feedParseFailures: 0,
-      krakenParseFailures: 0,
-    };
-  }
-
-  const referenceEnd = session.referenceEndedMonoMs ?? session.endedAtMonoMs ?? performance.now();
-  const contextStart = session.syncStartedMonoMs ?? session.measurementStartedMonoMs;
-  const contextEnd = session.endedAtMonoMs ?? performance.now();
-  const contextReference = session.kraken.trades.filter(
-    (trade) => trade.receivedMonoMs >= contextStart && trade.receivedMonoMs <= contextEnd,
-  );
-  const contextFeedCandidates = session.feed.trades.filter(
-    (trade) =>
-      trade.receivedMonoMs >= contextStart - config.probePreRollMs &&
-      trade.receivedMonoMs <= contextEnd,
-  );
-  const context = computeTradeMetrics(contextReference, contextFeedCandidates, {
-    maxLeadMs: config.probePreRollMs,
-    maxLagMs: config.probeDrainMs,
-  });
-  const measurementTrades = context.allTrades.filter(
-    (trade) =>
-      trade.receivedMonoMs >= session.measurementStartedMonoMs && trade.receivedMonoMs < referenceEnd,
-  );
-  const feedCandidates = session.feed.trades.filter(
-    (trade) =>
-      trade.receivedMonoMs >= session.measurementStartedMonoMs - config.probePreRollMs &&
-      trade.receivedMonoMs <= referenceEnd + config.probeDrainMs,
-  );
-  const syncTrades = context.allTrades.filter(
-    (trade) => trade.receivedMonoMs < session.measurementStartedMonoMs,
-  );
-  const drainTrades = context.allTrades.filter((trade) => trade.receivedMonoMs >= referenceEnd);
-  const measurementFeedEvents = session.feed.events.filter(
-    (event) =>
-      event.receivedMonoMs >= session.measurementStartedMonoMs && event.receivedMonoMs <= contextEnd,
-  );
-  const measurementKrakenEvents = session.kraken.events.filter(
-    (event) =>
-      event.receivedMonoMs >= session.measurementStartedMonoMs && event.receivedMonoMs < referenceEnd,
-  );
-  return {
-    ...summarizeTradeResults(measurementTrades),
-    feedCandidates,
-    sync: summarizeTradeResults(syncTrades),
-    drain: summarizeTradeResults(drainTrades),
-    feedMessages: measurementFeedEvents.length,
-    feedParseFailures: measurementFeedEvents.reduce((sum, event) => sum + event.parseFailures, 0),
-    krakenParseFailures: measurementKrakenEvents.reduce((sum, event) => sum + event.parseFailures, 0),
-  };
-}
-
-function previewRawMessage(raw) {
-  const text = typeof raw === "string"
-    ? raw
-    : raw instanceof ArrayBuffer
-      ? Buffer.from(raw).toString("utf8")
-      : ArrayBuffer.isView(raw)
-        ? Buffer.from(raw.buffer, raw.byteOffset, raw.byteLength).toString("utf8")
-        : String(raw);
-  return text.slice(0, 500);
-}
-
-function recordProbe(probe) {
-  db.exec("BEGIN");
-  try {
-    const info = db.prepare(`
-      INSERT INTO probes (
-        at, measurement_started_at, measurement_started_mono_ms, verdict, note, window_seconds, handshake_ms,
-        subscribe_to_first_message_ms, subscribe_to_first_trade_ms,
-        feed_messages, feed_parse_failures, measurement_feed_messages, measurement_feed_parse_failures,
-        feed_parsed_trades, feed_warmup_trades, feed_sync_trades,
-        kraken_messages, kraken_parse_failures, measurement_kraken_parse_failures,
-        kraken_sync_trades, sync_matched, sync_coverage_pct,
-        kraken_trades, our_trades, reference_trades, matched, coverage_pct,
-        delay_median_ms, delay_slow_ms, delay_max_ms, signed_delay_min_ms, signed_delay_median_ms,
-        feed_closes, feed_errors
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      probe.at, probe.measurementStartedAt ?? null, probe.measurementStartedMonoMs ?? null,
-      probe.verdict, probe.note ?? null,
-      probe.windowSeconds ?? null, probe.handshakeMs ?? null,
-      probe.subscribeToFirstMessageMs ?? null, probe.subscribeToFirstTradeMs ?? null,
-      probe.feedMessages ?? null, probe.feedParseFailures ?? null,
-      probe.measurementFeedMessages ?? null, probe.measurementFeedParseFailures ?? null,
-      probe.feedParsedTrades ?? null, probe.feedWarmupTrades ?? null, probe.feedSyncTrades ?? null,
-      probe.krakenMessages ?? null, probe.krakenParseFailures ?? null,
-      probe.measurementKrakenParseFailures ?? null, probe.krakenSyncTrades ?? null,
-      probe.syncMatched ?? null, probe.syncCoveragePct ?? null,
-      probe.krakenTrades ?? null, probe.ourTrades ?? null, probe.referenceTrades ?? null,
-      probe.matched ?? null, probe.coveragePct ?? null, probe.delayMedianMs ?? null,
-      probe.delaySlowMs ?? null, probe.delayMaxMs ?? null, probe.signedDelayMinMs ?? null,
-      probe.signedDelayMedianMs ?? null, probe.feedCloses ?? null, probe.feedErrors ?? null,
-    );
-    probe.id = Number(info.lastInsertRowid);
-    insertReferenceTrades(probe.id, "measurement", probe.trades || []);
-    insertReferenceTrades(probe.id, "sync", probe.syncTrades || []);
-    insertReferenceTrades(probe.id, "drain", probe.drainTrades || []);
-    insertFeedTrades(probe.id, probe.feedTrades || []);
-    insertMessageEvents(probe.id, probe.messageEvents || []);
-    db.exec("COMMIT");
-  } catch (error) {
-    db.exec("ROLLBACK");
-    throw error;
-  }
-}
-
-function insertReferenceTrades(probeId, scope, trades) {
-  const statement = db.prepare(
-    `INSERT INTO trades (
-      probe_id, scope, exchange_at_ms, kraken_received_at_ms, kraken_received_mono_ms, price, quantity, side,
-      kraken_trade_id, delivered, feed_received_at_ms, signed_delay_ms, delay_ms, matched_feed_sequence
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  );
-  for (const trade of trades) {
-    statement.run(
-      probeId, scope, trade.exchangeAtMs, trade.receivedAtMs, trade.receivedMonoMs, trade.price, trade.quantity,
-      trade.side, trade.tradeId ?? null, trade.delivered ? 1 : 0, trade.feedReceivedAtMs ?? null,
-      trade.signedDelayMs ?? null, trade.delayMs ?? null, trade.matchedFeedSequence ?? null,
-    );
-  }
-}
-
-function insertFeedTrades(probeId, trades) {
-  const statement = db.prepare(
-    `INSERT INTO feed_trades (
-      probe_id, sequence, phase, exchange_at_ms, received_at_ms, received_mono_ms,
-      price, quantity, side, matched_scope
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  );
-  for (const trade of trades) {
-    statement.run(
-      probeId, trade.sequence, trade.phase, trade.exchangeAtMs, trade.receivedAtMs, trade.receivedMonoMs,
-      trade.price, trade.quantity, trade.side, trade.matchedScope ?? null,
-    );
-  }
-}
-
-function insertMessageEvents(probeId, events) {
-  const statement = db.prepare(
-    `INSERT INTO message_events (
-      probe_id, source, sequence, phase, received_at_ms, received_mono_ms,
-      parsed_trades, parse_failures, raw_preview
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  );
-  for (const event of events) {
-    statement.run(
-      probeId, event.source, event.sequence, event.phase, event.receivedAtMs, event.receivedMonoMs,
-      event.parsedTrades, event.parseFailures, event.rawPreview ?? null,
-    );
-  }
-}
-
-function rowToProbe(row) {
-  if (!row) return null;
-  return {
-    id: row.id,
-    at: row.at,
-    measurementStartedAt: row.measurement_started_at,
-    measurementStartedMonoMs: row.measurement_started_mono_ms,
-    verdict: row.verdict,
-    note: row.note ?? "",
-    windowSeconds: row.window_seconds,
-    handshakeMs: row.handshake_ms,
-    subscribeToFirstMessageMs: row.subscribe_to_first_message_ms,
-    subscribeToFirstTradeMs: row.subscribe_to_first_trade_ms,
-    feedMessages: row.feed_messages,
-    feedParseFailures: row.feed_parse_failures,
-    measurementFeedMessages: row.measurement_feed_messages,
-    measurementFeedParseFailures: row.measurement_feed_parse_failures,
-    feedParsedTrades: row.feed_parsed_trades,
-    feedWarmupTrades: row.feed_warmup_trades,
-    feedSyncTrades: row.feed_sync_trades,
-    krakenMessages: row.kraken_messages,
-    krakenParseFailures: row.kraken_parse_failures,
-    measurementKrakenParseFailures: row.measurement_kraken_parse_failures,
-    krakenSyncTrades: row.kraken_sync_trades,
-    syncMatched: row.sync_matched,
-    syncCoveragePct: row.sync_coverage_pct,
-    krakenTrades: row.kraken_trades,
-    ourTrades: row.our_trades,
-    referenceTrades: row.reference_trades,
-    matched: row.matched,
-    coveragePct: row.coverage_pct,
-    delayMedianMs: row.delay_median_ms,
-    delaySlowMs: row.delay_slow_ms,
-    delayMaxMs: row.delay_max_ms,
-    signedDelayMinMs: row.signed_delay_min_ms,
-    signedDelayMedianMs: row.signed_delay_median_ms,
-    feedCloses: row.feed_closes,
-    feedErrors: row.feed_errors,
-  };
-}
-
-function getLastProbe() {
-  return rowToProbe(db.prepare("SELECT * FROM probes ORDER BY id DESC LIMIT 1").get());
-}
-
-function getProbeById(id) {
-  return rowToProbe(db.prepare("SELECT * FROM probes WHERE id = ?").get(id));
-}
-
-function getProbesSince(sinceMs) {
-  return db
-    .prepare("SELECT * FROM probes WHERE at >= ? ORDER BY id")
-    .all(new Date(sinceMs).toISOString())
-    .map(rowToProbe);
-}
-
-function getTrades(probeId, scope = "measurement") {
-  return db
-    .prepare(`SELECT
-      exchange_at_ms, kraken_received_at_ms, kraken_received_mono_ms, price, quantity, side, kraken_trade_id,
-      delivered, feed_received_at_ms, signed_delay_ms, delay_ms, matched_feed_sequence
-      FROM trades WHERE probe_id = ? AND scope = ? ORDER BY exchange_at_ms, kraken_received_at_ms, id`)
-    .all(probeId, scope)
-    .map((row) => ({
-      exchangeAtMs: row.exchange_at_ms,
-      receivedAtMs: row.kraken_received_at_ms,
-      receivedMonoMs: row.kraken_received_mono_ms,
-      price: row.price,
-      quantity: row.quantity,
-      side: row.side,
-      tradeId: row.kraken_trade_id,
-      delivered: row.delivered === 1,
-      feedReceivedAtMs: row.feed_received_at_ms,
-      signedDelayMs: row.signed_delay_ms,
-      delayMs: row.delay_ms,
-      matchedFeedSequence: row.matched_feed_sequence,
-    }));
-}
-
-function getFeedTrades(probeId) {
-  return db
-    .prepare(`SELECT sequence, phase, exchange_at_ms, received_at_ms, received_mono_ms,
-        price, quantity, side, matched_scope
-      FROM feed_trades WHERE probe_id = ? ORDER BY sequence`)
-    .all(probeId)
-    .map((row) => ({
-      sequence: row.sequence,
-      phase: row.phase,
-      exchangeAtMs: row.exchange_at_ms,
-      receivedAtMs: row.received_at_ms,
-      receivedMonoMs: row.received_mono_ms,
-      price: row.price,
-      quantity: row.quantity,
-      side: row.side,
-      matchedScope: row.matched_scope,
-    }));
-}
-
-function getMessageEvents(probeId) {
-  return db
-    .prepare(`SELECT source, sequence, phase, received_at_ms, received_mono_ms,
-        parsed_trades, parse_failures, raw_preview
-      FROM message_events WHERE probe_id = ? ORDER BY received_at_ms, id`)
-    .all(probeId)
-    .map((row) => ({
-      source: row.source,
-      sequence: row.sequence,
-      phase: row.phase,
-      receivedAtMs: row.received_at_ms,
-      receivedMonoMs: row.received_mono_ms,
-      parsedTrades: row.parsed_trades,
-      parseFailures: row.parse_failures,
-      rawPreview: row.raw_preview,
-    }));
-}
-
-function withTrades(probe) {
-  if (!probe) return null;
-  const trades = getTrades(probe.id);
-  return {
-    ...probe,
-    trades,
-    syncTrades: getTrades(probe.id, "sync"),
-    drainTrades: getTrades(probe.id, "drain"),
-    feedTrades: getFeedTrades(probe.id),
-    messageEvents: getMessageEvents(probe.id),
-    lostTrades: trades.filter((trade) => !trade.delivered),
-  };
-}
-
-function kvGet(key) {
-  return db.prepare("SELECT value FROM kv WHERE key = ?").get(key)?.value;
-}
-
-function kvSet(key, value) {
-  db.prepare(
-    "INSERT INTO kv (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-  ).run(key, String(value));
 }
 
 // --- notifications ---------------------------------------------------------
@@ -1091,152 +450,6 @@ function describeProblemDetail(probe) {
     default:
       return null;
   }
-}
-
-// Full breakdown of one probe, including every lost trade with its
-// exchange-side timestamp — evidence for debugging the feed server itself.
-function formatDetailsMessages(probe) {
-  const lines = [
-    `${verdictEmoji(probe.verdict)} <b>Перевірка №${probe.id ?? "—"}</b> — ${detailsHeadline(probe)}`,
-    `<i>${formatDateTime(probe.at)} · вікно ${probe.windowSeconds} с</i>`,
-  ];
-  if (probe.verdict === "inconclusive") {
-    lines.push("", describeInconclusiveDetail(probe));
-    return [lines.join("\n")];
-  }
-
-  lines.push(
-    "",
-    `Угод на біржі: ${referenceCount(probe)}`,
-    `Дійшло: ${probe.matched}${probe.coveragePct !== null ? ` (${probe.coveragePct}%)` : ""}`,
-  );
-  if (probe.delayMedianMs !== null && probe.delayMedianMs !== undefined) {
-    lines.push(`Затримка: зазвичай ${formatDelay(probe.delayMedianMs)}, максимум ${formatDelay(probe.delayMaxMs)}`);
-  }
-  if (probe.handshakeMs !== null && probe.handshakeMs !== undefined) {
-    lines.push(`Підключення: ${formatDelay(probe.handshakeMs)}`);
-  }
-  if (probe.subscribeToFirstTradeMs !== null && probe.subscribeToFirstTradeMs !== undefined) {
-    lines.push(`Перша угода після підписки: ${formatDelay(probe.subscribeToFirstTradeMs)}`);
-  }
-  if (probe.krakenSyncTrades > 0) {
-    lines.push(
-      `Перекривний прогрів: ${probe.syncMatched} з ${probe.krakenSyncTrades}` +
-        `${probe.syncCoveragePct !== null ? ` (${probe.syncCoveragePct}%)` : ""}`,
-    );
-  }
-  if (probe.measurementFeedParseFailures || probe.measurementKrakenParseFailures) {
-    lines.push(
-      `Помилки розбору у вікні: feed ${probe.measurementFeedParseFailures || 0}, ` +
-        `Kraken ${probe.measurementKrakenParseFailures || 0}`,
-    );
-  }
-  if (probe.feedCloses || probe.feedErrors) {
-    lines.push(`Обриви з'єднання: ${probe.feedCloses}, помилки сокета: ${probe.feedErrors}`);
-  }
-
-  const lost = probe.lostTrades || [];
-  if (lost.length === 0) {
-    lines.push(
-      "",
-      (probe.coveragePct ?? 100) < 100
-        ? "Перелік загублених угод для цієї перевірки не зберігся."
-        : "Загублених угод не було.",
-    );
-    return [lines.join("\n")];
-  }
-
-  // Full trade log: every reference trade in order with its status. The ✓/✗
-  // column shows the dynamics top-down, the rest of the row carries the
-  // trade itself. Telegram caps a message at 4096 characters, so the log is
-  // split into as many <pre> blocks (one per message) as needed — never
-  // truncated.
-  const trades = probe.trades || [];
-  const pattern = describeLossPattern(trades);
-
-  lines.push("", "<b>Угоди</b> (✓ дійшла · ✗ загублена)");
-  const priceWidth = Math.max(...trades.map((trade) => String(trade.price).length));
-  const rows = trades.map((trade) =>
-    `${trade.delivered ? "✓" : "✗"} ${formatTimeWithSeconds(trade.exchangeAtMs)}  ${String(trade.price).padStart(priceWidth)}  ${trade.quantity} ${trade.side}`,
-  );
-  const blocks = chunkRowsByLength(rows, 3500).map((chunk) => `<pre>${chunk.join("\n")}</pre>`);
-
-  const header = lines.join("\n");
-  const singleMessage = `${header}\n${blocks[0]}\n\n${pattern}`;
-  if (blocks.length === 1 && singleMessage.length <= TELEGRAM_MESSAGE_LIMIT) {
-    return [singleMessage];
-  }
-
-  const messages = [header, ...blocks];
-  const lastWithPattern = `${messages[messages.length - 1]}\n\n${pattern}`;
-  if (lastWithPattern.length <= TELEGRAM_MESSAGE_LIMIT) {
-    messages[messages.length - 1] = lastWithPattern;
-  } else {
-    messages.push(pattern);
-  }
-  return messages;
-}
-
-const TELEGRAM_MESSAGE_LIMIT = 4096;
-
-// Groups lines so each group's total length stays under maxLength.
-function chunkRowsByLength(rows, maxLength) {
-  const chunks = [];
-  let current = [];
-  let length = 0;
-  for (const row of rows) {
-    if (current.length > 0 && length + row.length + 1 > maxLength) {
-      chunks.push(current);
-      current = [];
-      length = 0;
-    }
-    current.push(row);
-    length += row.length + 1;
-  }
-  if (current.length > 0) chunks.push(current);
-  return chunks;
-}
-
-// Compact headline for /details, where the numbers block below already
-// carries the figures — no percentages repeated here.
-function detailsHeadline(probe) {
-  if (probe.verdict === "ok") return "сервер працював нормально";
-  if (probe.note === "kraken_disconnected") return "Kraken розірвав з’єднання";
-  if (probe.note === "kraken_unavailable") return "Kraken був недоступний";
-  if (probe.note === "kraken_parse_failure") return "повідомлення Kraken не вдалося розібрати";
-  if (probe.verdict === "inconclusive") return "ринок був надто тихий, щоб оцінити";
-  const label = {
-    connect_failed: "сервер не відповідав",
-    feed_silent: "угоди не доходили",
-    no_matches: "дані не збігалися з біржею",
-    invalid_feed_messages: "фід надсилав пошкоджені дані",
-    missing_trades: "частина угод губилася",
-    slow_delivery: "угоди доходили із запізненням",
-    socket_dropped: "сервер обривав з'єднання",
-  }[probe.note];
-  return label || (probe.verdict === "down" ? "сервер не працював" : "сервер працював з перебоями");
-}
-
-// Describe observed consecutive loss runs without guessing their server-side
-// cause. Delivered trades split runs; quiet exchange gaps over two seconds do
-// too. Exchange timestamps prevent Kraken packet batching from inventing runs.
-function describeLossPattern(trades) {
-  const analysis = analyzeLossRuns(trades);
-  if (analysis.runs.length === 0) return "Загублених угод не було.";
-
-  const positionLabel = {
-    all: "протягом усього вікна",
-    start: "на початку вікна",
-    middle: "посередині вікна",
-    end: "наприкінці вікна",
-  };
-  const descriptions = analysis.runs.map((run) => {
-    const duration = run.durationMs > 0 ? ` за ${formatDelay(run.durationMs)}` : "";
-    return `${run.count} ${tradesWord(run.count)} ${positionLabel[run.position]}${duration}`;
-  });
-  return analysis.runs.length === 1
-    ? `Втрати утворили одну безперервну серію: ${descriptions[0]}.`
-    : `Серії втрат (${analysis.runs.length}): ${descriptions.join("; ")}.`;
 }
 
 function formatStatsMessage() {
@@ -1435,7 +648,10 @@ function tradesWord(count) {
 // --- telegram --------------------------------------------------------------
 
 async function sendDetailsMessages(chatId, probe) {
-  for (const message of formatDetailsMessages(probe)) {
+  for (const message of formatDetailsMessages(probe, {
+    timeZone: config.quietHoursTimeZone,
+    describeInconclusive: describeInconclusiveDetail,
+  })) {
     await sendTelegramMessage(chatId, message);
   }
 }
@@ -1533,13 +749,6 @@ async function pollTelegramCommands() {
 // endpoint is read-only: the writable `db` handle is never used here, queries
 // go through a separate connection opened with readOnly.
 
-function getReadOnlyDb() {
-  if (!readOnlyDb) {
-    readOnlyDb = new DatabaseSync(config.dbFile, { readOnly: true });
-  }
-  return readOnlyDb;
-}
-
 function startApiServer() {
   if (!config.apiToken) {
     console.log("API disabled (no API_TOKEN set).");
@@ -1550,6 +759,33 @@ function startApiServer() {
     return;
   }
 
+  const handleApiRequest = createApiHandler({
+    apiToken: config.apiToken,
+    store,
+    startedAtMs: startedAt.getTime(),
+    getStatsContext: () => ({
+      quietHours: {
+        active: isQuietHours(),
+        label: formatQuietHoursLabel(),
+        timeZone: config.quietHoursTimeZone,
+      },
+      probeRunning: activeProbe !== null,
+      nextProbeAt: new Date(
+        (lastScheduledCycleAtMs ?? Date.now()) + config.probeIntervalMs,
+      ).toISOString(),
+      config: {
+        feedUrl: config.feedUrl,
+        feedChannel: config.feedChannel,
+        krakenSymbol: config.krakenSymbol,
+        probeIntervalMinutes: Math.round(config.probeIntervalMs / 60_000),
+        probeWarmupSeconds: Math.round(config.probeWarmupMs / 1000),
+        probePreRollSeconds: Math.round(config.probePreRollMs / 1000),
+        probeWindowSeconds: Math.round(config.probeWindowMs / 1000),
+        probeDrainSeconds: Math.round(config.probeDrainMs / 1000),
+        slowDelayMs: thresholds.slowDelayMs,
+      },
+    }),
+  });
   const server = http.createServer((request, response) => {
     handleApiRequest(request, response).catch((error) => {
       sendJson(response, 500, { error: error.message });
@@ -1563,183 +799,6 @@ function startApiServer() {
   server.listen(config.apiPort, () => {
     console.log(`API listening on port ${config.apiPort}.`);
   });
-}
-
-async function handleApiRequest(request, response) {
-  const url = new URL(request.url, "http://localhost");
-  const route = url.pathname.replace(/\/+$/, "") || "/";
-
-  // Unauthenticated liveness probe for Railway's healthcheck.
-  if (route === "/health") {
-    const last = getLastProbe();
-    sendJson(response, 200, {
-      ok: true,
-      uptimeSeconds: Math.round((Date.now() - startedAt.getTime()) / 1000),
-      lastProbeAt: last?.at ?? null,
-      lastVerdict: last?.verdict ?? null,
-    });
-    return;
-  }
-
-  if (!isAuthorized(request, url)) {
-    sendJson(response, 401, { error: "unauthorized" });
-    return;
-  }
-
-  if (route === "/api/stats") {
-    const last = getLastProbe();
-    const counts = getReadOnlyDb()
-      .prepare("SELECT verdict, COUNT(*) AS count FROM probes GROUP BY verdict")
-      .all();
-    const span = getReadOnlyDb()
-      .prepare("SELECT MIN(at) AS first, MAX(at) AS last, COUNT(*) AS total FROM probes")
-      .get();
-    sendJson(response, 200, {
-      now: new Date().toISOString(),
-      uptimeSeconds: Math.round((Date.now() - startedAt.getTime()) / 1000),
-      quietHours: { active: isQuietHours(), label: formatQuietHoursLabel(), timeZone: config.quietHoursTimeZone },
-      probeRunning: activeProbe !== null,
-      nextProbeAt: new Date((lastScheduledCycleAtMs ?? Date.now()) + config.probeIntervalMs).toISOString(),
-      history: { total: span?.total ?? 0, first: span?.first ?? null, last: span?.last ?? null },
-      verdictCounts: Object.fromEntries(counts.map((row) => [row.verdict, row.count])),
-      lastProbe: last,
-      config: {
-        feedUrl: config.feedUrl,
-        feedChannel: config.feedChannel,
-        krakenSymbol: config.krakenSymbol,
-        probeIntervalMinutes: Math.round(config.probeIntervalMs / 60_000),
-        probeWarmupSeconds: Math.round(config.probeWarmupMs / 1000),
-        probePreRollSeconds: Math.round(config.probePreRollMs / 1000),
-        probeWindowSeconds: Math.round(config.probeWindowMs / 1000),
-        probeDrainSeconds: Math.round(config.probeDrainMs / 1000),
-        slowDelayMs: thresholds.slowDelayMs,
-      },
-    });
-    return;
-  }
-
-  const probeMatch = /^\/api\/probes\/(\d+)$/.exec(route);
-  if (probeMatch) {
-    const probe = withTrades(getProbeById(Number(probeMatch[1])));
-    if (!probe) {
-      sendJson(response, 404, { error: "probe not found" });
-      return;
-    }
-    sendJson(response, 200, probe);
-    return;
-  }
-
-  if (route === "/api/probes") {
-    const limit = clampInt(url.searchParams.get("limit"), 100, 1, 2_000);
-    const conditions = [];
-    const parameters = [];
-
-    const hours = url.searchParams.get("hours");
-    const since = url.searchParams.get("since");
-    if (hours) {
-      conditions.push("at >= ?");
-      parameters.push(new Date(Date.now() - clampInt(hours, 24, 1, 24 * 365) * 3_600_000).toISOString());
-    } else if (since) {
-      conditions.push("at >= ?");
-      parameters.push(since);
-    }
-
-    const verdict = url.searchParams.get("verdict");
-    if (verdict) {
-      conditions.push(`verdict IN (${verdict.split(",").map(() => "?").join(", ")})`);
-      parameters.push(...verdict.split(","));
-    }
-
-    const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
-    const rows = getReadOnlyDb()
-      .prepare(`SELECT * FROM probes ${where} ORDER BY id DESC LIMIT ?`)
-      .all(...parameters, limit)
-      .map(rowToProbe);
-    sendJson(response, 200, { count: rows.length, probes: rows });
-    return;
-  }
-
-  if (route === "/api/sql") {
-    const sql = url.searchParams.get("q") || (request.method === "POST" ? await readBody(request) : "");
-    runReadOnlyQuery(response, sql);
-    return;
-  }
-
-  sendJson(response, 404, {
-    error: "unknown route",
-    routes: ["/health", "/api/stats", "/api/probes", "/api/probes/:id", "/api/sql?q=SELECT..."],
-  });
-}
-
-// Arbitrary SELECTs are the point of this API — ad-hoc questions about the
-// history ("which hours degrade?") are not worth a new endpoint each. The
-// connection is read-only, so the guards below only need to keep the query
-// itself from being a statement batch or an unbounded dump.
-function runReadOnlyQuery(response, rawSql) {
-  const sql = (rawSql || "").trim().replace(/;\s*$/, "");
-  if (!sql) {
-    sendJson(response, 400, { error: "missing query (?q= or POST body)" });
-    return;
-  }
-  if (!/^(select|with)\b/i.test(sql)) {
-    sendJson(response, 400, { error: "only SELECT/WITH queries are allowed" });
-    return;
-  }
-  if (sql.includes(";")) {
-    sendJson(response, 400, { error: "only a single statement is allowed" });
-    return;
-  }
-
-  try {
-    const startedMs = Date.now();
-    const rows = getReadOnlyDb().prepare(sql).all();
-    sendJson(response, 200, {
-      rowCount: rows.length,
-      truncated: rows.length > SQL_ROW_LIMIT,
-      elapsedMs: Date.now() - startedMs,
-      rows: rows.slice(0, SQL_ROW_LIMIT),
-    });
-  } catch (error) {
-    sendJson(response, 400, { error: error.message });
-  }
-}
-
-function isAuthorized(request, url) {
-  const header = request.headers.authorization || "";
-  const provided = header.startsWith("Bearer ") ? header.slice(7) : url.searchParams.get("token") || "";
-  const expected = Buffer.from(config.apiToken);
-  const actual = Buffer.from(provided);
-  return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
-}
-
-function readBody(request) {
-  return new Promise((resolve, reject) => {
-    let body = "";
-    request.on("data", (chunk) => {
-      body += chunk;
-      if (body.length > 100_000) {
-        reject(new Error("request body too large"));
-        request.destroy();
-      }
-    });
-    request.on("end", () => resolve(body));
-    request.on("error", reject);
-  });
-}
-
-function sendJson(response, status, payload) {
-  const body = JSON.stringify(payload, null, 2);
-  response.writeHead(status, {
-    "content-type": "application/json; charset=utf-8",
-    "content-length": Buffer.byteLength(body),
-  });
-  response.end(body);
-}
-
-function clampInt(value, fallback, min, max) {
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed)) return fallback;
-  return Math.min(max, Math.max(min, Math.trunc(parsed)));
 }
 
 // --- storage location and env ----------------------------------------------
