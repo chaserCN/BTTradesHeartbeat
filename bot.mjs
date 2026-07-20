@@ -61,7 +61,7 @@ const expectedProbeDurationMs =
 // diagnostic bot, so probe history is disposable: incompatible schemas reset
 // the measurement tables instead of carrying migration code. Service kv state
 // survives the reset so Telegram offsets are not replayed.
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 6;
 const db = new DatabaseSync(config.dbFile);
 db.exec("PRAGMA journal_mode = WAL;");
 const schemaVersion = db.prepare("PRAGMA user_version").get().user_version;
