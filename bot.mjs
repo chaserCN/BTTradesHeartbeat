@@ -32,7 +32,9 @@ const config = {
   // Read-only HTTP API over the collected history. Disabled unless API_TOKEN
   // is set; Railway injects PORT for the public domain.
   apiToken: process.env.API_TOKEN || "",
-  apiPort: Number(process.env.PORT || process.env.API_PORT || 0),
+  // Railway does not always inject PORT; 8080 matches the target port set on
+  // the public domain, so the API comes up without any extra variable.
+  apiPort: Number(process.env.PORT || process.env.API_PORT || 8080),
 };
 
 // Degradation thresholds. Healthy baseline measured 2026-07-19: the feed relays
@@ -1294,8 +1296,8 @@ function startApiServer() {
     console.log("API disabled (no API_TOKEN set).");
     return;
   }
-  if (!config.apiPort) {
-    console.log("API disabled (no PORT/API_PORT set).");
+  if (!Number.isInteger(config.apiPort) || config.apiPort <= 0) {
+    console.log(`API disabled (invalid port: ${process.env.PORT || process.env.API_PORT}).`);
     return;
   }
 
@@ -1309,7 +1311,7 @@ function startApiServer() {
     console.error("API server error:", error.message);
   });
 
-  server.listen(config.apiPort, "::", () => {
+  server.listen(config.apiPort, () => {
     console.log(`API listening on port ${config.apiPort}.`);
   });
 }
