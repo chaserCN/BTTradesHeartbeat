@@ -561,10 +561,8 @@ function formatDayMessage() {
     lines.push(`(показано лише ${shown.length} із ${entries.length})`);
   }
   for (const entry of shown) {
-    const summary = probeProblemSummary(entry);
     lines.push(formatDayProbeLine(entry, {
       timeZone: config.quietHoursTimeZone,
-      problemSummary: summary,
     }));
   }
   lines.push("", "Подробиці будь-якої перевірки: /details номер.");

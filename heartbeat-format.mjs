@@ -7,14 +7,13 @@ export const TELEGRAM_MESSAGE_LIMIT = 4_096;
 // deliberately shown as a diagnostic state rather than a misleading 0/0.
 export function formatDayProbeLine(probe, options = {}) {
   const timeZone = options.timeZone ?? "Europe/Kyiv";
-  const problemSummary = options.problemSummary;
-  const prefix = `№${probe.id}, ${formatTimeShort(probe.at, timeZone)}:`;
+  const emoji = verdictEmoji(probe.verdict);
+  const time = formatTimeShort(probe.at, timeZone);
   const hasReference = Number.isFinite(probe.referenceTrades) && probe.referenceTrades > 0;
   const result = hasReference
-    ? `дійшло ${probe.matched ?? 0}/${probe.referenceTrades} (${probe.coveragePct ?? "—"}%)`
-    : "немає еталонних угод";
-  const suffix = problemSummary ? ` — ${problemSummary}` : "";
-  return `${prefix} ${result} ${verdictEmoji(probe.verdict)}${suffix}`;
+    ? `${probe.matched ?? 0}/${probe.referenceTrades}`
+    : "—";
+  return `№${probe.id} ${emoji} ${time} ${result}`;
 }
 
 export function formatDetailsMessages(probe, options = {}) {
