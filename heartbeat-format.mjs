@@ -9,11 +9,62 @@ export function formatDayProbeLine(probe, options = {}) {
   const timeZone = options.timeZone ?? "Europe/Kyiv";
   const emoji = verdictEmoji(probe.verdict);
   const time = formatTimeShort(probe.at, timeZone);
-  const hasReference = Number.isFinite(probe.referenceTrades) && probe.referenceTrades > 0;
-  const result = hasReference
+  const result = hasReferenceTrades(probe)
     ? `${probe.matched ?? 0}/${probe.referenceTrades}`
     : "—";
   return `№${probe.id} ${emoji} ${time} ${result}`;
+}
+
+function hasReferenceTrades(probe) {
+  return Number.isFinite(probe.referenceTrades) && probe.referenceTrades > 0;
+}
+
+// One morning message for everything the chat missed while notifications were
+// muted: how much of the night was affected, which checks to open, and where
+// things stand now. The current-state line is omitted when a regular alert for
+// the morning probe follows, so the digest stays about the night only.
+export function formatQuietHoursDigestMessage(digest, options = {}) {
+  const timeZone = options.timeZone ?? "Europe/Kyiv";
+  const maxProbeLines = options.maxProbeLines ?? 24;
+
+  const lines = ["🌙 <b>Що було за тихі години</b>", ""];
+  if (options.quietHoursLabel) {
+    lines.push(`Сповіщення були вимкнені (${options.quietHoursLabel}), але перевірки тривали.`);
+  }
+  lines.push(`Перевірок: ${digest.total}, з них із проблемами: ${digest.problems.length}.`);
+  if (digest.referenceFailures.length > 0) {
+    lines.push(`Не вдалося перевірити через Kraken: ${digest.referenceFailures.length}.`);
+  }
+
+  const affected = [...digest.problems, ...digest.referenceFailures]
+    .sort((lhs, rhs) => (lhs.id ?? 0) - (rhs.id ?? 0));
+  const shown = affected.slice(-maxProbeLines);
+  lines.push("");
+  if (shown.length < affected.length) {
+    lines.push(`(показано лише ${shown.length} із ${affected.length})`);
+  }
+  // Unlike /day this list is short and read once, so each line also says what
+  // was wrong: full coverage with slow delivery is a problem the counts alone
+  // cannot show.
+  for (const entry of shown) {
+    const line = formatDayProbeLine(entry, { timeZone });
+    const summary = probeProblemSummary(entry);
+    if (!summary) {
+      lines.push(line);
+    } else {
+      // A missing reference already ends the line with an em dash placeholder,
+      // which then reads as the separator instead of doubling it.
+      lines.push(hasReferenceTrades(entry) ? `${line} — ${summary}` : `${line} ${summary}`);
+    }
+  }
+
+  lines.push("");
+  if (options.currentStateLine) {
+    lines.push(`Зараз: ${options.currentStateLine}`);
+  }
+  lines.push("Подробиці будь-якої перевірки: /details номер.");
+
+  return lines.join("\n");
 }
 
 export function formatDetailsMessages(probe, options = {}) {
@@ -129,6 +180,41 @@ export function chunkTextByLength(text, maxLength) {
   }
   if (current) chunks.push(current);
   return chunks;
+}
+
+// Short "what was wrong" for one probe in a list. Returns null for results that
+// need no explanation, so callers can fall back to the bare line.
+export function probeProblemSummary(entry) {
+  switch (entry.note) {
+    case "connect_failed":
+      return "сервер не відповідав";
+    case "feed_silent":
+    case "no_matches":
+      return "угоди не доходили";
+    case "invalid_feed_messages":
+      return "фід надсилав пошкоджені дані";
+    case "missing_trades":
+      // The line already carries the delivered/expected counts.
+      return "губилися угоди";
+    case "slow_delivery": {
+      const delay = entry.delayP90Ms ?? entry.delayMaxMs;
+      return delay === null || delay === undefined
+        ? "угоди доходили із запізненням"
+        : `затримки до ${formatDelay(delay)}`;
+    }
+    case "socket_dropped":
+      return "обривалося з'єднання";
+    case "kraken_disconnected":
+      return "Kraken розірвав з’єднання";
+    case "kraken_unavailable":
+      return "Kraken був недоступний";
+    case "kraken_parse_failure":
+      return "повідомлення Kraken не розібралося";
+    case "quiet_market":
+      return "тихий ринок";
+    default:
+      return null;
+  }
 }
 
 function detailsHeadline(probe) {

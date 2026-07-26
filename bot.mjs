@@ -5,8 +5,14 @@ import { fileURLToPath } from "node:url";
 
 import { judgeProbe } from "./heartbeat-core.mjs";
 import { createApiHandler, sendJson } from "./heartbeat-api.mjs";
-import { isKrakenReferenceFailure, runScheduledProbeSequence } from "./heartbeat-cycle.mjs";
-import { formatDayProbeLine, formatDetailsMessages } from "./heartbeat-format.mjs";
+import {
+  clearQuietPeriod,
+  collectQuietHoursDigest,
+  isKrakenReferenceFailure,
+  rememberQuietPeriodStart,
+  runScheduledProbeSequence,
+} from "./heartbeat-cycle.mjs";
+import { formatDayProbeLine, formatDetailsMessages, formatQuietHoursDigestMessage } from "./heartbeat-format.mjs";
 import { collectSession, computeSessionMetrics } from "./heartbeat-session.mjs";
 import { createHeartbeatStore } from "./heartbeat-storage.mjs";
 import {
@@ -328,31 +334,68 @@ async function runProbe() {
 // last *notified* problem verdict.
 // During quiet hours nothing is sent and lastNotifiedVerdict stays unchanged,
 // so the first probe after quiet hours delivers the catch-up automatically.
+// A problem that also *ended* overnight leaves nothing to catch up on, so the
+// muted period is summarized in one morning digest before that.
 // Kraken reference failures notify separately after their automatic retry but
 // never reset the last known verdict of our feed.
 async function maybeNotifyVerdict(probe) {
-  if (isKrakenReferenceFailure(probe)) {
-    if (isQuietHours()) {
-      console.log(`Quiet hours: holding back "${probe.note}" notification.`);
-      return;
-    }
-    await notify(formatKrakenReferenceFailureMessage(probe));
-    return;
+  const quiet = isQuietHours();
+  if (quiet) {
+    // Anchored at the start of the whole cycle, not at this probe: a confirmed
+    // problem arrives here as the last probe of the sequence, and the probes it
+    // was confirming belong in the same digest.
+    rememberQuietPeriodStart({ kvGet, kvSet }, activeProbe?.startedAtMs ?? probe.startedAtMs ?? Date.parse(probe.at));
   }
 
-  if (probe.verdict !== "ok" && probe.verdict !== "degraded" && probe.verdict !== "down") return;
+  const pending = resolveVerdictNotification(probe, quiet);
+  const digest = quiet ? null : collectQuietHoursDigest({
+    kvGet,
+    kvSet,
+    getProbesSince,
+    isQuietHours,
+    nowMs: Date.now(),
+  });
+
+  if (digest) {
+    await notify(formatQuietHoursDigestMessage(digest, {
+      timeZone: config.quietHoursTimeZone,
+      quietHoursLabel: formatQuietHoursLabel(),
+      // A separate alert about the current problem follows in that case.
+      currentStateLine: pending ? null : describeVerdictLine(probe),
+    }));
+    // Only now: an undelivered digest must survive to the next probe.
+    clearQuietPeriod({ kvSet });
+  }
+
+  if (pending) {
+    await notify(pending.text);
+    if (pending.remember) kvSet("lastNotifiedVerdict", pending.remember);
+  }
+}
+
+// Decides in one place what this probe owes the chat: the message and, for a
+// verdict change, the verdict to remember once Telegram accepted it.
+function resolveVerdictNotification(probe, quiet) {
+  if (isKrakenReferenceFailure(probe)) {
+    if (quiet) {
+      console.log(`Quiet hours: holding back "${probe.note}" notification.`);
+      return null;
+    }
+    return { text: formatKrakenReferenceFailureMessage(probe) };
+  }
+
+  if (probe.verdict !== "ok" && probe.verdict !== "degraded" && probe.verdict !== "down") return null;
 
   const lastNotified = kvGet("lastNotifiedVerdict") || "ok";
   const isProblem = probe.verdict === "degraded" || probe.verdict === "down";
-  if (!isProblem && probe.verdict === lastNotified) return;
+  if (!isProblem && probe.verdict === lastNotified) return null;
 
-  if (isQuietHours()) {
+  if (quiet) {
     console.log(`Quiet hours: holding back "${probe.verdict}" notification (last notified: "${lastNotified}").`);
-    return;
+    return null;
   }
 
-  await notify(formatVerdictChangeMessage(probe, lastNotified));
-  kvSet("lastNotifiedVerdict", probe.verdict);
+  return { text: formatVerdictChangeMessage(probe, lastNotified), remember: probe.verdict };
 }
 
 async function notify(text, { ignoreQuietHours = false } = {}) {
@@ -595,35 +638,6 @@ function describeVerdictLine(probe) {
       if (probe.note === "kraken_unavailable") return "⚪ стан невідомий: Kraken недоступний.";
       if (probe.note === "kraken_parse_failure") return "⚪ стан невідомий: повідомлення Kraken не вдалося розібрати.";
       return "⚪ ринок був надто тихий, щоб оцінити (мало угод на біржі).";
-  }
-}
-
-// Short "what was wrong" for one probe in the /day list.
-function probeProblemSummary(entry) {
-  switch (entry.note) {
-    case "connect_failed":
-      return "сервер не відповідав";
-    case "feed_silent":
-    case "no_matches":
-      return "угоди не доходили";
-    case "invalid_feed_messages":
-      return "фід надсилав пошкоджені дані";
-    case "missing_trades":
-      return `губилися угоди (дійшло ${entry.coveragePct}%)`;
-    case "slow_delivery":
-      return `затримки до ${formatDelay(entry.delayP90Ms ?? entry.delayMaxMs)}`;
-    case "socket_dropped":
-      return "обривалося з'єднання";
-    case "kraken_disconnected":
-      return "Kraken розірвав з’єднання";
-    case "kraken_unavailable":
-      return "Kraken був недоступний";
-    case "kraken_parse_failure":
-      return "повідомлення Kraken не розібралося";
-    case "quiet_market":
-      return "тихий ринок";
-    default:
-      return null;
   }
 }
 

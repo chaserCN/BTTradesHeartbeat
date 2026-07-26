@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { formatDayProbeLine, formatDetailsMessages, TELEGRAM_MESSAGE_LIMIT } from "../heartbeat-format.mjs";
+import {
+  formatDayProbeLine,
+  formatDetailsMessages,
+  formatQuietHoursDigestMessage,
+  TELEGRAM_MESSAGE_LIMIT,
+} from "../heartbeat-format.mjs";
 
 // Intent: /day must make each check comparable at a glance without turning a
 // missing Kraken reference into the misleading result "0/0".
@@ -15,7 +20,7 @@ test("day lines show delivery coverage or an explicit missing-reference state", 
       referenceTrades: 150,
       coveragePct: 100,
     }, { timeZone: "Europe/Kyiv" }),
-    "№1, 17:42: дійшло 150/150 (100%) 🟢",
+    "№1 🟢 17:42 150/150",
   );
   assert.equal(
     formatDayProbeLine({
@@ -25,8 +30,8 @@ test("day lines show delivery coverage or an explicit missing-reference state", 
       matched: 78,
       referenceTrades: 100,
       coveragePct: 78,
-    }, { timeZone: "Europe/Kyiv", problemSummary: "губилися угоди" }),
-    "№2, 17:42: дійшло 78/100 (78%) 🟠 — губилися угоди",
+    }, { timeZone: "Europe/Kyiv" }),
+    "№2 🟠 17:42 78/100",
   );
   assert.equal(
     formatDayProbeLine({
@@ -36,8 +41,8 @@ test("day lines show delivery coverage or an explicit missing-reference state", 
       matched: 0,
       referenceTrades: 0,
       coveragePct: null,
-    }, { timeZone: "Europe/Kyiv", problemSummary: "тихий ринок" }),
-    "№3, 17:42: немає еталонних угод ⚪ — тихий ринок",
+    }, { timeZone: "Europe/Kyiv" }),
+    "№3 ⚪ 17:42 —",
   );
 });
 
@@ -197,6 +202,102 @@ test("every verdict detail variant is bounded and contains no missing placeholde
     assert.doesNotMatch(messages.join("\n"), /undefined|NaN/);
   }
 });
+
+// Intent: the morning digest is the only trace of an overnight problem, so it
+// must name every affected check and say where things stand now.
+test("the quiet-hours digest lists affected checks and the current state", () => {
+  const digest = {
+    total: 10,
+    problems: [
+      nightEntry(41, "2026-07-20T23:42:00Z", "degraded", 44, 61, "missing_trades"),
+      nightEntry(43, "2026-07-21T01:42:00Z", "down", 0, 57, "feed_silent"),
+    ],
+    referenceFailures: [nightEntry(45, "2026-07-21T03:42:00Z", "inconclusive", 0, 0, "kraken_unavailable")],
+    worstVerdict: "down",
+  };
+
+  const message = formatQuietHoursDigestMessage(digest, {
+    timeZone: "UTC",
+    quietHoursLabel: "23:00-09:00 Europe/Kyiv",
+    currentStateLine: "🟢 сервер працює нормально.",
+  });
+
+  assert.ok(message.length <= TELEGRAM_MESSAGE_LIMIT);
+  assert.doesNotMatch(message, /undefined|NaN/);
+  assert.match(message, /Перевірок: 10, з них із проблемами: 2\./);
+  assert.match(message, /Не вдалося перевірити через Kraken: 1\./);
+  assert.match(message, /№41 🟠 23:42 44\/61 — губилися угоди/);
+  assert.match(message, /№43 🔴 01:42 0\/57 — угоди не доходили/);
+  assert.match(message, /№45 ⚪ 03:42 — Kraken був недоступний/);
+  assert.doesNotMatch(message, /— —/, "the missing-reference dash doubles as the separator");
+  assert.match(message, /Зараз: 🟢 сервер працює нормально\./);
+  assert.doesNotMatch(message, /показано лише/);
+});
+
+// Intent: full coverage with slow delivery is the one problem the counts alone
+// cannot show, so the reason must be there — with or without a measured delay.
+test("the digest explains a problem the delivery counts hide", () => {
+  const slow = nightEntry(52, "2026-07-21T02:42:00Z", "degraded", 52, 52, "slow_delivery");
+  const measured = formatQuietHoursDigestMessage(
+    { total: 6, problems: [{ ...slow, delayP90Ms: 8_200, delayMaxMs: 12_400 }], referenceFailures: [], worstVerdict: "degraded" },
+    { timeZone: "UTC" },
+  );
+  assert.match(measured, /№52 🟠 02:42 52\/52 — затримки до 8,2 с/);
+
+  const unmeasured = formatQuietHoursDigestMessage(
+    { total: 6, problems: [{ ...slow, delayP90Ms: null, delayMaxMs: null }], referenceFailures: [], worstVerdict: "degraded" },
+    { timeZone: "UTC" },
+  );
+  assert.match(unmeasured, /№52 🟠 02:42 52\/52 — угоди доходили із запізненням/);
+  assert.doesNotMatch(unmeasured, /невідомо/);
+});
+
+// Intent: an unhealthy night can hold far more probes than a chat message can
+// carry, and a dropped tail must be visible rather than silently truncated.
+test("a long quiet period is capped with an explicit count and keeps the latest checks", () => {
+  const problems = Array.from({ length: 40 }, (_, index) =>
+    nightEntry(100 + index, `2026-07-21T0${index % 6}:0${index % 6}:00Z`, "degraded", 10, 20, "missing_trades"));
+  const message = formatQuietHoursDigestMessage(
+    { total: 60, problems, referenceFailures: [], worstVerdict: "degraded" },
+    { timeZone: "UTC", maxProbeLines: 24 },
+  );
+
+  assert.match(message, /\(показано лише 24 із 40\)/);
+  assert.equal((message.match(/^№\d+ /gmu) || []).length, 24);
+  assert.match(message, /№139 /);
+  assert.doesNotMatch(message, /№115 /);
+  assert.ok(message.length <= TELEGRAM_MESSAGE_LIMIT);
+});
+
+// Intent: when the morning probe still fails, its own alert follows the digest,
+// so the digest must not state the current verdict a second time.
+test("the digest omits the current state when a verdict alert follows", () => {
+  const message = formatQuietHoursDigestMessage(
+    {
+      total: 4,
+      problems: [nightEntry(51, "2026-07-21T02:42:00Z", "down", 0, 30, "connect_failed")],
+      referenceFailures: [],
+      worstVerdict: "down",
+    },
+    { timeZone: "UTC", quietHoursLabel: "23:00-09:00 Europe/Kyiv" },
+  );
+
+  assert.doesNotMatch(message, /Зараз:/);
+  assert.doesNotMatch(message, /Kraken/);
+  assert.match(message, /Подробиці будь-якої перевірки: \/details номер\./);
+});
+
+function nightEntry(id, at, verdict, matched, referenceTrades, note = "") {
+  return {
+    id,
+    at,
+    verdict,
+    note,
+    matched,
+    referenceTrades,
+    coveragePct: referenceTrades === 0 ? null : Math.round((matched * 100) / referenceTrades),
+  };
+}
 
 function countOccurrences(text, needle) {
   return text.split(needle).length - 1;

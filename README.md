@@ -33,12 +33,14 @@ Exchange timestamps and local receive timestamps are stored separately. Relative
 
 Probes run around the clock and every result is recorded — quiet hours (23:00–09:00 Kyiv by default) only mute notifications. If the verdict changed overnight, the first probe after quiet hours end sends the catch-up message. Telegram commands work during quiet hours.
 
+A problem that both starts and ends while notifications are muted leaves nothing for that catch-up to report: by morning the verdict is `ok` again. So the muted period is remembered (in `kv`, to survive a restart) and the first probe after quiet hours end also sends a morning digest of what was held back — how many checks ran, how many found problems, how many could not be checked because of Kraken, and one line per affected check — number, result and a short reason, because full coverage with slow delivery is a problem the counts alone cannot show. The numbers are the same ones `/details` takes. A clean night sends nothing. The digest is only cleared after Telegram accepts it, so a failed send is retried on the next probe; if the bot is down for whole mornings, the digest covers at most the last 24 hours.
+
 ## Telegram commands
 
 Restricted to `TELEGRAM_CHAT_ID` (this bot lives in its own group, separate from the app_store bot):
 
 - `/stats` — current state of the feed, last probe, whether quiet hours are active, uptime.
-- `/day` — the last 24 hours as a list: one compact result per persistent probe number (`№47, 19:42: дійшло 78/100 (78%) 🟠 — губилися угоди`), plus totals and typical/worst delay.
+- `/day` — the last 24 hours as a list: one compact result per persistent probe number (`№47 🟠 19:42 78/100`), plus totals and typical/worst delay.
 - `/check` — run a probe right now and reply with the result (normally under two minutes including setup and delivery drain). While any probe is running, repeated `/check` commands are not processed: the first duplicate gets a short "already running" notice, the rest are dropped, and the scheduled hourly probe also never overlaps a manual one.
 - `/details` — user-focused breakdown of the last probe: counts, delays, actual parse/socket problems, and every reference trade with exchange-side time, price, quantity, side, and delivery status. Internal activation, handshake and overlapping-sync telemetry stays in the API instead of adding Telegram noise. Loss runs are described from the full ordered stream, so a delivered trade breaks a run and Kraken packet batching cannot invent one. `/details 47` (also `№47`) shows the same for a recorded probe number.
 
@@ -114,7 +116,7 @@ SQLite via Node's built-in `node:sqlite` (needs Node ≥ 22.13; still zero npm d
 - `feed_trades` — every successfully parsed feed trade, including unmatched warmup and drain records.
 - `message_events` — every feed/Kraken WebSocket message with source, phase, receive time, parsed-trade count and parse failures; a short raw preview is retained only for malformed messages.
 - `socket_events` — open, subscribe, acknowledgement, timeout, error and close events with phase, wall/monotonic time and close metadata.
-- `kv` — service state: Telegram update offset, last notified verdict, first-run marker.
+- `kv` — service state: Telegram update offset, last notified verdict, start of the current quiet period (pending morning digest), first-run marker.
 
 This is an internal diagnostic bot and its early history is disposable. A schema-version change recreates `probes`, `trades`, `feed_trades`, `message_events`, and `socket_events` instead of running migrations; `kv` survives so Telegram updates are not replayed. Within one schema version history remains queryable with plain SQL.
 
