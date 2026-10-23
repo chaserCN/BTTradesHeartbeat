@@ -86,17 +86,19 @@ export async function probeHttps(options = {}) {
 
 export function describeHttps(probe) {
   if (!probe) return "HTTPS-графік BTC/USD Kraken: перевірок ще не було.";
+  const seconds = (probe.durationMs / 1000).toFixed(2);
   const reasons = {
-    ok: "працює", http_error: `HTTP ${probe.status}`, api_error: "API повернув помилку",
+    ok: `працює. Час завантаження: ${seconds} с`,
+    http_error: `помилка HTTP ${probe.status}`, api_error: "API повернув помилку",
     empty_chart: "графік порожній", invalid_chart: "некоректні дані графіка",
     future_data: "час даних у майбутньому", stale_data: "дані старіші за допустимий поріг",
     invalid_json: "замість JSON отримано некоректну відповідь", oversize: "відповідь завелика",
-    timeout: "сервер не завершив відповідь вчасно", network_error: "помилка мережі, DNS або TLS",
-    slow: "графік завантажується повільно",
+    timeout: `сервер не завершив відповідь за ${Math.round(probe.durationMs / 1000)} с`,
+    network_error: "помилка мережі, DNS або TLS",
+    slow: `графік завантажується повільно — ${seconds} с`,
   };
   const icon = probe.verdict === "ok" ? "🟢" : probe.verdict === "degraded" ? "🟠" : "🔴";
-  return `${icon} HTTPS-графік BTC/USD Kraken: ${reasons[probe.note] || "помилка"}. ` +
-    `${(probe.durationMs / 1000).toFixed(2)} с; точок: ${probe.points}.`;
+  return `${icon} HTTPS-графік BTC/USD Kraken: ${reasons[probe.note] || "помилка"}.`;
 }
 
 // Single flight is independent of the long WebSocket probe. Notification state
