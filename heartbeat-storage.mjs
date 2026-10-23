@@ -69,6 +69,14 @@ export function createHeartbeatStore(dbFile) {
     `);
   }
   db.exec(schemaSql());
+  // Additive table: do not bump the destructive WS schema version.
+  db.exec(`CREATE TABLE IF NOT EXISTS https_probes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    at TEXT NOT NULL,
+    verdict TEXT NOT NULL,
+    duration_ms INTEGER NOT NULL,
+    payload TEXT NOT NULL
+  );`);
 
   let readOnlyDb = null;
 
@@ -280,6 +288,21 @@ export function createHeartbeatStore(dbFile) {
     ).run(key, String(value));
   }
 
+  function recordHttpsProbe(probe) {
+    const result = db.prepare("INSERT INTO https_probes (at, verdict, duration_ms, payload) VALUES (?, ?, ?, ?)")
+      .run(probe.at, probe.verdict, probe.durationMs, JSON.stringify(probe));
+    probe.id = Number(result.lastInsertRowid);
+  }
+
+  function getHttpsProbes(limit = 100) {
+    return db.prepare("SELECT id, payload FROM https_probes ORDER BY id DESC LIMIT ?").all(limit)
+      .map((row) => ({ ...JSON.parse(row.payload), id: row.id }));
+  }
+
+  function getLastHttpsProbe() {
+    return getHttpsProbes(1)[0] ?? null;
+  }
+
   function getReadOnlyDb() {
     if (!readOnlyDb) readOnlyDb = new DatabaseSync(dbFile, { readOnly: true });
     return readOnlyDb;
@@ -303,6 +326,9 @@ export function createHeartbeatStore(dbFile) {
     kvGet,
     kvSet,
     recordProbe,
+    recordHttpsProbe,
+    getHttpsProbes,
+    getLastHttpsProbe,
     withTrades,
   };
 }

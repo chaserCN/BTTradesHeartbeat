@@ -125,3 +125,39 @@ For Railway, mount a volume; if `STATE_DIR` is not set, the bot automatically us
 ## Railway
 
 Same pattern as the app_store bot: set the variables from `.env.example` in Railway Variables, mount a volume for state. No secrets beyond the Telegram token.
+
+## HTTPS chart monitoring
+
+The same bot also checks the production HTTPS line-chart endpoint for BTC/USD
+on Kraken (`term=24h&short=true`) immediately at startup and every 5 minutes.
+Its independent timer and single-flight guard are separate from WebSocket probes;
+a long WS measurement or confirmation wait does not delay chart checks.
+
+A check requires HTTP 200, API `code=200`, a nonempty chart with valid positive
+prices/timestamps, and a valid live quote. Both the quote and latest chart point
+must be no more than 15 minutes old. Future timestamps beyond 5 minutes fail
+(the current chart bucket can be rounded forward). A response taking over
+5 seconds is degraded. The 15-second timeout covers connection and the entire
+body; bodies over 2 MB, invalid JSON, redirects, TLS/network errors, and HTTP/API
+errors fail. TLS verification stays enabled, with no HTTP fallback. Each cycle
+makes one request; a failure is checked again on the next 5-minute tick.
+
+Settings: `HTTPS_INTERVAL_MINUTES=5`, `HTTPS_TIMEOUT_SECONDS=15`,
+`HTTPS_SLOW_SECONDS=5`, `HTTPS_MAX_AGE_MINUTES=15`. Defaults work without adding
+Railway variables. This check covers this specific chart route/market, not every
+HTTPS endpoint or exchange.
+
+- `/stats` includes the last HTTPS result and check time.
+- `/https` shows the last 12 HTTPS checks (approximately one hour).
+- Authenticated `GET /api/https/probes?limit=100` returns HTTPS history, newest
+  first (maximum 2000 rows). `/api/stats` also includes an `https` section.
+- `https_probes` stores time, verdict, duration and the complete diagnostic result
+  as JSON. It is queryable through the existing read-only SQL API. This additive
+  table does not reset existing WebSocket history.
+
+HTTPS notifications are sent on a change between healthy, degraded and down;
+unchanged results are silent. Quiet hours mute alerts but not checks. Failures
+seen during quiet hours are summarized on the first check outside quiet hours,
+even if the chart recovered overnight. Notification state survives restarts and
+is updated only after Telegram accepts the message. Telegram sends have a
+15-second timeout so an unavailable Telegram service cannot block future checks.

@@ -52,7 +52,14 @@ export function createApiHandler(options) {
         verdictCounts: Object.fromEntries(counts.map((row) => [row.verdict, row.count])),
         lastProbe: last,
         config: context.config,
+        https: context.https,
       });
+      return;
+    }
+
+    if (route === "/api/https/probes") {
+      const probes = store.getHttpsProbes(clampInt(url.searchParams.get("limit"), 100, 1, 2000));
+      sendJson(response, 200, { count: probes.length, probes });
       return;
     }
 
@@ -102,7 +109,7 @@ export function createApiHandler(options) {
 
     sendJson(response, 404, {
       error: "unknown route",
-      routes: ["/health", "/api/stats", "/api/probes", "/api/probes/:id", "/api/sql?q=SELECT..."],
+      routes: ["/api/https/probes", "/health", "/api/stats", "/api/probes", "/api/probes/:id", "/api/sql?q=SELECT..."],
     });
   };
 }

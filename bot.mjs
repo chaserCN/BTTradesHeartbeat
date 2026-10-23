@@ -3,6 +3,8 @@ import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { httpsConfig, probeHttps, createHttpsMonitor, describeHttps } from "./https-probe.mjs";
+
 import { judgeProbe } from "./heartbeat-core.mjs";
 import { createApiHandler, sendJson } from "./heartbeat-api.mjs";
 import {
@@ -79,6 +81,20 @@ const {
 } = store;
 
 const startedAt = new Date();
+const httpsOptions = httpsConfig();
+const httpsMonitor = createHttpsMonitor({
+  store,
+  probe: () => probeHttps(httpsOptions),
+  notify: (message) => sendTelegramMessage(config.telegramChatId, message),
+  isQuiet: () => isQuietHours(),
+});
+
+async function httpsCycle() {
+  try {
+    const result = await httpsMonitor.run();
+    if (result) console.log(`HTTPS chart: ${result.verdict} (${result.note}), ${result.durationMs}ms.`);
+  } catch (error) { console.error("HTTPS cycle failed:", error.message); }
+}
 
 // Only one probe may run at a time — the feed server degrades under extra
 // connections, and overlapping probes would skew each other's numbers.
@@ -115,7 +131,11 @@ if (!config.runOnce) {
   });
 }
 
-await heartbeatCycle();
+// Start HTTPS on its own cadence; a WS probe/confirmation cannot delay it.
+if (!config.runOnce) {
+  setInterval(() => { void httpsCycle(); }, httpsOptions.intervalMs);
+}
+await Promise.all([heartbeatCycle(), httpsCycle()]);
 
 if (!config.runOnce) {
   setInterval(() => {
@@ -553,6 +573,10 @@ function formatStatsMessage() {
       ? "Наступна перевірка ось-ось почнеться."
       : `Наступна перевірка о ${formatTimeShort(nextProbeAtMs)}.`,
   );
+  const httpsProbe = store.getLastHttpsProbe();
+  lines.push("", describeHttps(httpsProbe));
+  if (httpsProbe) lines.push(`Остання HTTPS-перевірка: ${formatDateTime(httpsProbe.at)}.`);
+  lines.push(`HTTPS: кожні ${httpsOptions.intervalMs / 60_000} хв. Історія: /https.`);
   lines.push(`Uptime: ${formatDuration(now - startedAt)}.`);
 
   return lines.join("\n");
@@ -679,6 +703,7 @@ async function sendTelegramMessage(chatId, text) {
 
   const response = await fetch(`https://api.telegram.org/bot${config.telegramBotToken}/sendMessage`, {
     method: "POST",
+    signal: AbortSignal.timeout(15_000),
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       chat_id: chatId,
@@ -728,6 +753,10 @@ async function pollTelegramCommands() {
     const command = parts[0].split("@")[0].toLowerCase();
     if (command === "/stats" || command === "stats") {
       await sendTelegramMessage(chatId, formatStatsMessage());
+    } else if (command === "/https" || command === "https") {
+      const history = store.getHttpsProbes(12).reverse();
+      const lines = history.map((entry) => `${formatDateTime(entry.at)} — ${describeHttps(entry)}`);
+      await sendTelegramMessage(chatId, lines.length ? lines.join("\n") : "HTTPS-перевірок ще не було.");
     } else if (command === "/day" || command === "day") {
       await sendTelegramMessage(chatId, formatDayMessage());
     } else if (command === "/details" || command === "details" || command === "/detail" || command === "detail") {
@@ -783,6 +812,11 @@ function startApiServer() {
         active: isQuietHours(),
         label: formatQuietHoursLabel(),
         timeZone: config.quietHoursTimeZone,
+      },
+      https: {
+        probeRunning: httpsMonitor.running,
+        intervalMinutes: httpsOptions.intervalMs / 60_000,
+        lastProbe: store.getLastHttpsProbe(),
       },
       probeRunning: activeProbe !== null,
       nextProbeAt: new Date(
